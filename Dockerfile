@@ -1,13 +1,19 @@
 FROM python:3.10-slim
 
+# Pin uv version for reproducible builds
+COPY --from=ghcr.io/astral-sh/uv:0.4.30 /uv /bin/uv
+
 WORKDIR /app
 
-# Copy requirements first for better caching
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Copy dependency files first for layer cache optimization
+COPY pyproject.toml uv.lock ./
 
-# Copy the application code
+# Install runtime dependencies only (no dev group)
+RUN uv sync --frozen --no-dev --no-cache
+
+# Copy application code
 COPY . .
 
-# Run the application
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+EXPOSE 8000
+
+CMD ["uv", "run", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

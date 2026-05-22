@@ -1,148 +1,120 @@
+"""Example A2A client for the Google Maps A2A Server.
+
+Run with:
+    uv sync
+    uv run python example_client.py
+
+Set API_KEY and BASE_URL below or via environment variables.
+"""
 import asyncio
-import json
+import os
 import uuid
 from datetime import datetime
 
 import httpx
 
-# Configuration
-BASE_URL = "http://localhost:8000"
-API_KEY = "your_api_key_here"  # Replace with your API key
+BASE_URL = os.getenv("A2A_BASE_URL", "http://localhost:8000")
+API_KEY = os.getenv("API_KEY", "your_api_key_here")
 
-async def main():
-    """Example A2A client for Google Maps A2A server"""
-    async with httpx.AsyncClient() as client:
-        # 1. Discover agent capabilities (agent card)
-        print("Fetching agent card...")
-        response = await client.get(f"{BASE_URL}/agent-card")
-        agent_card = response.json()
-        print(f"Agent name: {agent_card['name']}")
-        print(f"Available tasks: {[task['type'] for task in agent_card['tasks']]}")
-        print("-" * 50)
-        
-        # 2. Create a geocoding task
-        print("Creating geocoding task...")
-        task_data = {
-            "id": str(uuid.uuid4()),
+HEADERS = {
+    "X-API-Key": API_KEY,
+    "Content-Type": "application/json",
+}
+
+
+def separator():
+    print("-" * 60)
+
+
+async def single_step_geocode(client: httpx.AsyncClient) -> None:
+    """Demonstrate the single-step /tasks/run endpoint (primary Kore AI path)."""
+    print("=== Single-step geocode via POST /tasks/run ===")
+    response = await client.post(
+        f"{BASE_URL}/tasks/run",
+        headers=HEADERS,
+        json={
             "type": "geocode",
-            "status": "created",
-            "created_at": datetime.now().isoformat(),
-            "updated_at": datetime.now().isoformat(),
             "input": {
                 "format": "text",
-                "content": "1600 Amphitheatre Parkway, Mountain View, CA"
-            }
-        }
-        
-        response = await client.post(
-            f"{BASE_URL}/tasks",
-            headers={"X-API-Key": API_KEY},
-            json=task_data
-        )
-        
-        if response.status_code != 200:
-            print(f"Error creating task: {response.text}")
-            return
-        
-        task = response.json()
-        task_id = task["id"]
-        print(f"Task created with ID: {task_id}")
-        print("-" * 50)
-        
-        # 3. Execute the task
-        print("Executing task...")
-        response = await client.put(
-            f"{BASE_URL}/tasks/{task_id}/execute",
-            headers={"X-API-Key": API_KEY}
-        )
-        
-        if response.status_code != 200:
-            print(f"Error executing task: {response.text}")
-            return
-        
-        result = response.json()
-        print(f"Task status: {result['status']}")
-        
-        # 4. Print the result in a readable format
-        if result["output"] and result["output"]["format"] == "application/json":
-            output_content = result["output"]["content"]
-            if "results" in output_content and len(output_content["results"]) > 0:
-                location = output_content["results"][0]["geometry"]["location"]
-                address = output_content["results"][0]["formatted_address"]
-                print(f"Address: {address}")
-                print(f"Coordinates: Latitude {location['lat']}, Longitude {location['lng']}")
-        
-        print("-" * 50)
-        
-        # 5. Create a directions task
-        print("Creating directions task...")
-        directions_task = {
-            "id": str(uuid.uuid4()),
-            "type": "directions",
-            "status": "created",
-            "created_at": datetime.now().isoformat(),
-            "updated_at": datetime.now().isoformat(),
-            "input": {
-                "format": "application/json",
-                "content": {
-                    "origin": "San Francisco, CA",
-                    "destination": "Mountain View, CA",
-                    "mode": "driving"
-                }
-            }
-        }
-        
-        response = await client.post(
-            f"{BASE_URL}/tasks",
-            headers={"X-API-Key": API_KEY},
-            json=directions_task
-        )
-        
-        if response.status_code != 200:
-            print(f"Error creating directions task: {response.text}")
-            return
-        
-        directions_task_id = response.json()["id"]
-        print(f"Directions task created with ID: {directions_task_id}")
-        print("-" * 50)
-        
-        # 6. Execute the directions task
-        print("Executing directions task...")
-        response = await client.put(
-            f"{BASE_URL}/tasks/{directions_task_id}/execute",
-            headers={"X-API-Key": API_KEY}
-        )
-        
-        if response.status_code != 200:
-            print(f"Error executing directions task: {response.text}")
-            return
-        
-        directions_result = response.json()
-        print(f"Directions task status: {directions_result['status']}")
-        
-        # 7. Process and print directions in a readable format
-        if directions_result["output"] and directions_result["output"]["format"] == "application/json":
-            routes = directions_result["output"]["content"].get("routes", [])
-            if routes:
-                legs = routes[0].get("legs", [])
-                if legs:
-                    distance = legs[0].get("distance", {}).get("text", "Unknown")
-                    duration = legs[0].get("duration", {}).get("text", "Unknown")
-                    print(f"Distance: {distance}")
-                    print(f"Duration: {duration}")
-                    
-                    # Print the first few steps of directions
-                    print("\nDirections:")
-                    steps = legs[0].get("steps", [])
-                    for i, step in enumerate(steps[:3]):  # First 3 steps
-                        instruction = step.get("html_instructions", "")
-                        # Remove HTML tags for better readability
-                        instruction = instruction.replace("<b>", "").replace("</b>", "")
-                        instruction = instruction.replace("<div>", " ").replace("</div>", "")
-                        print(f"  {i+1}. {instruction}")
-                    
-                    if len(steps) > 3:
-                        print(f"  ... and {len(steps) - 3} more steps")
+                "content": "1600 Amphitheatre Parkway, Mountain View, CA",
+            },
+        },
+    )
+
+    if response.status_code != 200:
+        print(f"Error: {response.status_code} {response.text}")
+        return
+
+    result = response.json()
+    print(f"Status: {result['status']}")
+    if result.get("output") and result["output"]["format"] == "application/json":
+        data = result["output"]["content"]
+        if data.get("results"):
+            loc = data["results"][0]["geometry"]["location"]
+            addr = data["results"][0]["formatted_address"]
+            print(f"Address: {addr}")
+            print(f"Coordinates: {loc['lat']}, {loc['lng']}")
+    separator()
+
+
+async def two_step_directions(client: httpx.AsyncClient) -> None:
+    """Demonstrate the two-step A2A flow (standard protocol path)."""
+    print("=== Two-step directions via POST /tasks → PUT /tasks/{id}/execute ===")
+
+    task_id = str(uuid.uuid4())
+    task_data = {
+        "id": task_id,
+        "type": "directions",
+        "status": "created",
+        "created_at": datetime.now().isoformat(),
+        "updated_at": datetime.now().isoformat(),
+        "input": {
+            "format": "application/json",
+            "content": {
+                "origin": "San Francisco, CA",
+                "destination": "Mountain View, CA",
+                "mode": "driving",
+            },
+        },
+    }
+
+    # Step 1: create
+    response = await client.post(f"{BASE_URL}/tasks", headers=HEADERS, json=task_data)
+    if response.status_code != 200:
+        print(f"Error creating task: {response.status_code} {response.text}")
+        return
+    print(f"Task created: {task_id}")
+
+    # Step 2: execute
+    response = await client.put(f"{BASE_URL}/tasks/{task_id}/execute", headers=HEADERS)
+    if response.status_code != 200:
+        print(f"Error executing task: {response.status_code} {response.text}")
+        return
+
+    result = response.json()
+    print(f"Status: {result['status']}")
+    if result.get("output") and result["output"]["format"] == "application/json":
+        routes = result["output"]["content"].get("routes", [])
+        if routes:
+            leg = routes[0]["legs"][0]
+            print(f"Distance: {leg.get('distance', {}).get('text', 'N/A')}")
+            print(f"Duration: {leg.get('duration', {}).get('text', 'N/A')}")
+    separator()
+
+
+async def main() -> None:
+    async with httpx.AsyncClient() as client:
+        # Discover capabilities
+        print("=== Agent Card (capability discovery) ===")
+        response = await client.get(f"{BASE_URL}/agent-card")
+        card = response.json()
+        print(f"Agent: {card['name']} v{card['version']}")
+        print(f"Task types: {[t['type'] for t in card['tasks']]}")
+        separator()
+
+        await single_step_geocode(client)
+        await two_step_directions(client)
+
 
 if __name__ == "__main__":
     asyncio.run(main())

@@ -126,3 +126,13 @@ To further enhance A2A compliance:
 2. Implement persistent storage for tasks
 3. Add fine-grained authentication and authorization
 4. Support agent-to-agent discovery mechanisms
+
+---
+
+## Non-standard Extension: `POST /tasks/run`
+
+This server adds `POST /tasks/run` as a convenience endpoint not defined in the A2A specification.
+
+It combines task creation and execution into a single synchronous HTTP request, returning the completed (or failed) task in one response. This is intended for callers that cannot make two sequential requests per operation — for example, the Kore AI Agent Platform v1, which calls external tools as single HTTP requests.
+
+Standard A2A clients should continue using the two-step flow (`POST /tasks` → `PUT /tasks/{id}/execute`) for full protocol compliance. See [usage.md](usage.md) for details on both flows.

@@ -1,165 +1,43 @@
 # Google Maps A2A Server
 
-An open-source Agent2Agent (A2A) compliant server that provides Google Maps capabilities to other agents via a standardized protocol.
+An [Agent2Agent (A2A) protocol](https://github.com/google/A2A)-compliant server that provides Google Maps capabilities to other agents and AI systems via a standardized HTTP API.
 
-This project implements the [Agent2Agent (A2A) protocol](https://github.com/google/A2A) created by Google, which enables different AI agents to communicate and collaborate with each other using a standardized interface.
+Supports: geocoding, reverse geocoding, directions, places search, place details, and distance matrix — all accessible as A2A tasks.
 
-## Features
+## Quick Start
 
-- **A2A Protocol Compliance**: Implements the Agent2Agent protocol for seamless agent-to-agent communication
-- **Google Maps API Integration**: Provides access to various Google Maps services:
-  - Geocoding (address to coordinates)
-  - Reverse geocoding (coordinates to address)
-  - Directions between locations
-  - Places search
-  - Place details
-  - Distance matrix calculations
-- **Task Lifecycle Management**: Handles the entire task lifecycle (created, in-progress, completed, failed)
-- **Capability Discovery**: Provides an agent card that describes available capabilities
-- **Security**: Basic API key authentication
+```bash
+# Install dependencies
+uv sync
+
+# Configure environment
+cp .env.example .env
+# Edit .env and fill in API_KEY and GOOGLE_MAPS_API_KEY
+
+# Run locally
+uv run uvicorn main:app --reload
+```
+
+The server starts on http://localhost:8000. Interactive API docs are available at http://localhost:8000/docs.
 
 ## Documentation
 
-- [Usage Guide](docs/USAGE.md) - Detailed instructions on how to use the API
-- [A2A Implementation Details](docs/A2A_IMPLEMENTATION.md) - Information about how this server implements the A2A protocol
+| Document | Contents |
+|----------|----------|
+| [docs/usage.md](docs/usage.md) | API reference, all endpoints, environment variables, task types, request/response examples |
+| [docs/a2a-implementation.md](docs/a2a-implementation.md) | A2A protocol compliance details and non-standard extensions |
+| [docs/deployment.md](docs/deployment.md) | fly.io deployment guide, secrets management, costs |
+| [docs/google-maps-setup.md](docs/google-maps-setup.md) | Google Cloud Console setup, enabling APIs, API key creation and restriction |
+| [docs/security.md](docs/security.md) | API key authentication, IP allowlist, CORS, HTTPS |
+| [docs/kore-ai.md](docs/kore-ai.md) | Kore AI Agent Platform v1 integration guide |
 
-## Prerequisites
-
-- Python 3.8+
-- Google Maps API key
-- Docker (optional, for containerized deployment)
-
-## Installation
-
-### Local Setup
-
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/pab1it0/google-maps-a2a.git
-   cd google-maps-a2a
-   ```
-
-2. Create a virtual environment and install dependencies:
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   pip install -r requirements.txt
-   ```
-
-3. Configure environment variables:
-   ```bash
-   # Create a .env file
-   cp .env.example .env
-   # Edit .env with your keys
-   ```
-
-4. Run the server:
-   ```bash
-   uvicorn main:app --reload
-   ```
-
-### Docker Setup
-
-1. Build the Docker image:
-   ```bash
-   docker build -t google-maps-a2a .
-   ```
-
-2. Run the container:
-   ```bash
-   docker run -p 8000:8000 \
-     -e API_KEY=your_api_key_here \
-     -e GOOGLE_MAPS_API_KEY=your_google_maps_api_key_here \
-     google-maps-a2a
-   ```
-
-## Usage
-
-### Agent Card
-
-To discover the server's capabilities, send a GET request to the `/agent-card` endpoint:
+## Running Tests
 
 ```bash
-curl http://localhost:8000/agent-card
+uv sync --group dev
+uv run pytest test_server.py -v --cov=main --cov-report=term-missing
 ```
-
-### Creating a Task
-
-To create a new task, send a POST request to the `/tasks` endpoint:
-
-```bash
-curl -X POST http://localhost:8000/tasks \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: your_api_key_here" \
-  -d '{
-    "type": "geocode",
-    "input": {
-      "format": "text",
-      "content": "1600 Amphitheatre Parkway, Mountain View, CA"
-    }
-  }'
-```
-
-### Checking Task Status
-
-To check the status of a task, send a GET request to the `/tasks/{task_id}` endpoint:
-
-```bash
-curl http://localhost:8000/tasks/your-task-id-here \
-  -H "X-API-Key: your_api_key_here"
-```
-
-### Executing a Task
-
-To execute a task, send a PUT request to the `/tasks/{task_id}/execute` endpoint:
-
-```bash
-curl -X PUT http://localhost:8000/tasks/your-task-id-here/execute \
-  -H "X-API-Key: your_api_key_here"
-```
-
-## A2A Protocol Integration
-
-This server follows the [Agent2Agent (A2A) protocol](https://github.com/google/A2A) specification for agent communication:
-
-1. **Agent Card**: Provides a standardized descriptor of capabilities
-2. **Task-based Interaction**: Uses a task-oriented approach for handling requests
-3. **Standardized Formats**: Supports multiple input/output formats
-4. **Status Tracking**: Manages the full lifecycle of tasks
-
-## API Documentation
-
-Once the server is running, you can access the Swagger UI documentation at:
-
-```
-http://localhost:8000/docs
-```
-
-## Development
-
-### Running Tests
-
-The project includes a test suite to ensure functionality:
-
-```bash
-python -m pytest test_server.py -v
-```
-
-### Environment Variables
-
-- `API_KEY`: The API key for accessing the server
-- `GOOGLE_MAPS_API_KEY`: Your Google Maps API key
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## Acknowledgements
-
-- [Google's Agent2Agent (A2A) Protocol](https://github.com/google/A2A) for the interoperability specification
-- Google Maps Platform for their mapping services
-- FastAPI for the web framework
+MIT — see [LICENSE](LICENSE) for details.
