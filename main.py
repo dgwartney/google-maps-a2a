@@ -547,9 +547,17 @@ request_handler = DefaultRequestHandler(
     agent_card=AGENT_CARD,
 )
 
-jsonrpc_routes = create_jsonrpc_routes(request_handler, rpc_url="/")
+jsonrpc_routes = create_jsonrpc_routes(
+    request_handler,
+    rpc_url="/",
+    enable_v0_3_compat=True,  # accept both 'SendMessage' (v1.0) and 'message/send' (v0.3/inspector)
+)
 
 AGENT_CARD_DICT = json_format.MessageToDict(AGENT_CARD)
+# Add fields required by the a2a-sdk Pydantic AgentCard model that are not present
+# in the protobuf serialisation: top-level `url` (primary endpoint) and `protocolVersion`.
+AGENT_CARD_DICT["url"] = f"{config.base_url.rstrip('/')}/"
+AGENT_CARD_DICT["protocolVersion"] = "1.0"
 
 
 async def get_well_known_agent_card(request: Request) -> JSONResponse:
