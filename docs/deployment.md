@@ -53,14 +53,22 @@ flyctl status
 curl https://google-maps-a2a.fly.dev/health
 # Expected: {"status":"ok"}
 
-# Capability discovery (no auth required)
-curl https://google-maps-a2a.fly.dev/agent-card
+# A2A v1 capability discovery — standard well-known URL (no auth required)
+curl https://google-maps-a2a.fly.dev/.well-known/agent-card.json
 
-# Single-step test (replace <API_KEY> with your chosen key)
-curl -X POST https://google-maps-a2a.fly.dev/tasks/run \
+# Test via JSON-RPC SendMessage (replace <API_KEY> with your chosen key)
+curl -X POST https://google-maps-a2a.fly.dev/ \
   -H "X-API-Key: <API_KEY>" \
   -H "Content-Type: application/json" \
-  -d '{"type":"geocode","input":{"format":"text","content":"Times Square, New York"}}'
+  -H "A2A-Version: 1.0" \
+  -d '{
+    "jsonrpc":"2.0","id":"1","method":"SendMessage",
+    "params":{"message":{"messageId":"m1","role":"ROLE_USER","parts":[{
+      "data":{"type":"geocode","input":{"format":"text","content":"Times Square, New York"}},
+      "mediaType":"application/json"
+    }]}}
+  }'
+# Expected: result.message.parts[0].data.results[0].geometry.location contains lat/lng
 ```
 
 ---

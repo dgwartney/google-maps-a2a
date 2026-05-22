@@ -1,31 +1,60 @@
+"""
+Google Maps A2A Agent — A2A Protocol v1 compliant server.
+
+Transport:   JSON-RPC 2.0 over HTTP (POST /)
+Discovery:   GET /.well-known/agent-card.json
+Auth:        X-API-Key header (validated by middleware)
+Framework:   a2a-sdk + Starlette
+"""
+
+import hmac
+import json
 import logging
-import os
 import re
 import uuid
-from datetime import datetime
-from enum import Enum
-from typing import Any, Dict, Optional, Union
+from typing import Any
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from fastapi.security import APIKeyHeader
-from pydantic import BaseModel, Field, field_validator
+from a2a.server.agent_execution import AgentExecutor, RequestContext
+from a2a.server.events import EventQueue
+from a2a.server.request_handlers import DefaultRequestHandler
+from a2a.server.routes.jsonrpc_routes import create_jsonrpc_routes
+from a2a.server.tasks import InMemoryTaskStore
+from a2a.types.a2a_pb2 import (
+    APIKeySecurityScheme,
+    AgentCapabilities,
+    AgentCard,
+    AgentInterface,
+    AgentSkill,
+    Part,
+    ROLE_AGENT,
+    SecurityScheme,
+)
+from google.protobuf import json_format
+from google.protobuf.struct_pb2 import Struct, Value
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from starlette.applications import Starlette
+from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
+from starlette.routing import Route
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
 class Config(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=".env", env_file_encoding="utf-8", extra="ignore"
+    )
 
     api_key: str = ""
     google_maps_api_key: str = ""
     log_level: str = "INFO"
     allowed_ips: str = ""
+    base_url: str = "https://google-maps-a2a.fly.dev"
 
     @field_validator("google_maps_api_key")
     @classmethod
@@ -48,8 +77,6 @@ class Config(BaseSettings):
         return {ip.strip() for ip in self.allowed_ips.split(",") if ip.strip()}
 
 
-# Instantiate config first so LOG_LEVEL is available for logging setup.
-# pydantic-settings reads .env automatically — no manual load_dotenv() needed.
 config = Config()
 
 logging.basicConfig(
@@ -58,278 +85,93 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-if not config.api_key:
+if not config.api_key:  # pragma: no cover
     logger.warning("API_KEY is not set — all authenticated endpoints will reject requests")
 
 # ---------------------------------------------------------------------------
-# A2A Protocol models
+# Google Maps Service (handlers unchanged from original)
 # ---------------------------------------------------------------------------
 
-SUPPORTED_TASK_TYPES = frozenset({
-    "geocode",
-    "reverse_geocode",
-    "directions",
-    "places_search",
-    "place_details",
-    "distance_matrix",
-})
+GOOGLE_MAPS_BASE_URL = "https://maps.googleapis.com/maps/api"
 
-
-class TaskStatus(str, Enum):
-    CREATED = "created"
-    IN_PROGRESS = "in_progress"
-    COMPLETED = "completed"
-    FAILED = "failed"
-
-
-class InputFormat(str, Enum):
-    TEXT = "text"
-    JSON = "application/json"
-    MARKDOWN = "text/markdown"
-
-
-class OutputFormat(str, Enum):
-    TEXT = "text"
-    JSON = "application/json"
-    MARKDOWN = "text/markdown"
-    GEOJSON = "application/geo+json"
-
-
-class TaskInput(BaseModel):
-    format: InputFormat
-    content: Union[str, Dict[str, Any]]
-
-    @field_validator("content")
-    @classmethod
-    def content_must_not_be_empty(cls, v: Union[str, Dict[str, Any]]) -> Union[str, Dict[str, Any]]:
-        if isinstance(v, str) and not v.strip():
-            raise ValueError("content must not be empty")
-        if isinstance(v, dict) and not v:
-            raise ValueError("content dict must not be empty")
-        return v
-
-
-class TaskOutput(BaseModel):
-    format: OutputFormat
-    content: Union[str, Dict[str, Any]]
-
-
-class Task(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    type: str
-    status: TaskStatus = TaskStatus.CREATED
-    created_at: str = Field(default_factory=lambda: datetime.now().isoformat())
-    updated_at: str = Field(default_factory=lambda: datetime.now().isoformat())
-    input: TaskInput
-    output: Optional[TaskOutput] = None
-
-    @field_validator("type")
-    @classmethod
-    def type_must_be_supported(cls, v: str) -> str:
-        if v not in SUPPORTED_TASK_TYPES:
-            raise ValueError(f"type must be one of {sorted(SUPPORTED_TASK_TYPES)}")
-        return v
-
-
-# ---------------------------------------------------------------------------
-# Agent Card
-# ---------------------------------------------------------------------------
-
-AGENT_CARD = {
-    "schema_version": "v1",
-    "name": "Google Maps A2A",
-    "description": "An A2A-compliant agent that provides Google Maps capabilities",
-    "version": "1.0.0",
-    "contact": "https://github.com/yourusername/google-maps-a2a",
-    "auth": {
-        "type": "api_key",
-        "header_name": "X-API-Key",
-    },
-    "input_formats": [
-        {"format": "text", "description": "Natural language query for maps operations"},
-        {"format": "application/json", "description": "Structured data for maps operations"},
-    ],
-    "output_formats": [
-        {"format": "text", "description": "Text response with maps information"},
-        {"format": "application/json", "description": "JSON response with structured maps data"},
-        {"format": "application/geo+json", "description": "GeoJSON formatted location data"},
-    ],
-    "tasks": [
-        {
-            "type": "geocode",
-            "description": "Convert addresses to latitude and longitude coordinates",
-            "input_formats": ["text", "application/json"],
-            "output_formats": ["application/json", "application/geo+json"],
-        },
-        {
-            "type": "reverse_geocode",
-            "description": "Convert coordinates to addresses",
-            "input_formats": ["application/json"],
-            "output_formats": ["application/json", "text"],
-        },
-        {
-            "type": "directions",
-            "description": "Get directions between locations",
-            "input_formats": ["application/json"],
-            "output_formats": ["application/json", "text"],
-        },
-        {
-            "type": "places_search",
-            "description": "Search for places using Google Places API",
-            "input_formats": ["text", "application/json"],
-            "output_formats": ["application/json", "application/geo+json"],
-        },
-        {
-            "type": "place_details",
-            "description": "Get detailed information about a specific place",
-            "input_formats": ["application/json"],
-            "output_formats": ["application/json"],
-        },
-        {
-            "type": "distance_matrix",
-            "description": "Calculate travel distance and time between points",
-            "input_formats": ["application/json"],
-            "output_formats": ["application/json"],
-        },
-    ],
-}
-
-# ---------------------------------------------------------------------------
-# Repository
-# ---------------------------------------------------------------------------
-
-class TaskRepository:
-    """In-memory task storage."""
-
-    def __init__(self) -> None:
-        self._store: Dict[str, Task] = {}
-
-    def save(self, task: Task) -> Task:
-        self._store[task.id] = task
-        return task
-
-    def get(self, task_id: str) -> Optional[Task]:
-        return self._store.get(task_id)
-
-    def require(self, task_id: str) -> Task:
-        task = self._store.get(task_id)
-        if task is None:
-            logger.warning("Task not found id=%s", task_id)
-            raise HTTPException(status_code=404, detail="Task not found")
-        return task
-
-
-# ---------------------------------------------------------------------------
-# Google Maps service
-# ---------------------------------------------------------------------------
 
 class GoogleMapsService:
-    """Wraps all Google Maps API calls as async methods."""
-
-    BASE_URL = "https://maps.googleapis.com/maps/api"
+    """Calls Google Maps Platform APIs."""
 
     def __init__(self, api_key: str) -> None:
         self._api_key = api_key
 
     def _client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(
-            base_url=self.BASE_URL,
+            base_url=GOOGLE_MAPS_BASE_URL,
             params={"key": self._api_key},
         )
 
-    async def execute(self, task: Task) -> TaskOutput:
+    async def execute(self, task_type: str, fmt: str, content: Any, output_format: str | None = None) -> dict:
+        """Dispatch to the appropriate handler and return the result dict."""
         handlers = {
-            "geocode": self.geocode,
-            "reverse_geocode": self.reverse_geocode,
-            "directions": self.directions,
-            "places_search": self.places_search,
-            "place_details": self.place_details,
-            "distance_matrix": self.distance_matrix,
+            "geocode": self._geocode,
+            "reverse_geocode": self._reverse_geocode,
+            "directions": self._directions,
+            "places_search": self._places_search,
+            "place_details": self._place_details,
+            "distance_matrix": self._distance_matrix,
         }
-        handler = handlers[task.type]
+        handler = handlers.get(task_type)
+        if handler is None:
+            raise ValueError(f"Unknown task type: {task_type}")
         async with self._client() as client:
-            logger.debug("Calling Google Maps API type=%s id=%s", task.type, task.id)
-            return await handler(task, client)
+            logger.debug("Calling Google Maps API type=%s", task_type)
+            return await handler(fmt, content, output_format, client)
 
-    async def geocode(self, task: Task, client: httpx.AsyncClient) -> TaskOutput:
-        if task.input.format == InputFormat.TEXT:
-            address = task.input.content
-        else:
-            address = task.input.content.get("address", "")
-
+    async def _geocode(self, fmt: str, content: Any, output_format: str | None, client: httpx.AsyncClient) -> dict:
+        address = content if fmt == "text" else content.get("address", "")
         response = await client.get("/geocode/json", params={"address": address})
         data = response.json()
-
         if response.status_code != 200 or data.get("status") != "OK":
             logger.warning("Google Maps API error status=%s", data.get("status"))
-            raise HTTPException(status_code=400, detail=f"Geocoding failed: {data.get('status')}")
-
-        if task.output and task.output.format == OutputFormat.GEOJSON:
-            result = data.get("results", [])[0]
-            location = result.get("geometry", {}).get("location", {})
-            geojson = {
+            raise ValueError(f"Geocoding failed: {data.get('status')}")
+        if output_format == "application/geo+json":
+            result = data["results"][0]
+            location = result["geometry"]["location"]
+            return {
                 "type": "Feature",
-                "geometry": {
-                    "type": "Point",
-                    "coordinates": [location.get("lng"), location.get("lat")],
-                },
+                "geometry": {"type": "Point", "coordinates": [location["lng"], location["lat"]]},
                 "properties": {
-                    "formatted_address": result.get("formatted_address"),
-                    "place_id": result.get("place_id"),
+                    "formatted_address": result["formatted_address"],
+                    "place_id": result["place_id"],
                 },
             }
-            return TaskOutput(format=OutputFormat.GEOJSON, content=geojson)
+        return data
 
-        return TaskOutput(format=OutputFormat.JSON, content=data)
-
-    async def reverse_geocode(self, task: Task, client: httpx.AsyncClient) -> TaskOutput:
-        if task.input.format != InputFormat.JSON:
-            raise HTTPException(status_code=400, detail="Reverse geocoding requires JSON input")
-
-        lat = task.input.content.get("lat")
-        lng = task.input.content.get("lng")
-
+    async def _reverse_geocode(self, fmt: str, content: Any, output_format: str | None, client: httpx.AsyncClient) -> dict:
+        if fmt != "application/json":
+            raise ValueError("Reverse geocoding requires JSON input")
+        lat, lng = content.get("lat"), content.get("lng")
         if lat is None or lng is None:
-            raise HTTPException(status_code=400, detail="Latitude and longitude required")
-
+            raise ValueError("Latitude and longitude required")
         response = await client.get("/geocode/json", params={"latlng": f"{lat},{lng}"})
         data = response.json()
-
         if response.status_code != 200 or data.get("status") != "OK":
             logger.warning("Google Maps API error status=%s", data.get("status"))
-            raise HTTPException(status_code=400, detail=f"Reverse geocoding failed: {data.get('status')}")
+            raise ValueError(f"Reverse geocoding failed: {data.get('status')}")
+        if output_format == "text":
+            return {"address": data["results"][0]["formatted_address"]}
+        return data
 
-        if task.output and task.output.format == OutputFormat.TEXT:
-            result = data.get("results", [])[0]
-            return TaskOutput(
-                format=OutputFormat.TEXT,
-                content=result.get("formatted_address", "Address not found"),
-            )
-
-        return TaskOutput(format=OutputFormat.JSON, content=data)
-
-    async def directions(self, task: Task, client: httpx.AsyncClient) -> TaskOutput:
-        if task.input.format != InputFormat.JSON:
-            raise HTTPException(status_code=400, detail="Directions requires JSON input")
-
-        origin = task.input.content.get("origin")
-        destination = task.input.content.get("destination")
-        mode = task.input.content.get("mode", "driving")
-
+    async def _directions(self, fmt: str, content: Any, output_format: str | None, client: httpx.AsyncClient) -> dict:
+        if fmt != "application/json":
+            raise ValueError("Directions requires JSON input")
+        origin, destination = content.get("origin"), content.get("destination")
         if not origin or not destination:
-            raise HTTPException(status_code=400, detail="Origin and destination required")
-
-        response = await client.get(
-            "/directions/json",
-            params={"origin": origin, "destination": destination, "mode": mode},
-        )
+            raise ValueError("Origin and destination required")
+        mode = content.get("mode", "driving")
+        response = await client.get("/directions/json", params={"origin": origin, "destination": destination, "mode": mode})
         data = response.json()
-
         if response.status_code != 200 or data.get("status") != "OK":
             logger.warning("Google Maps API error status=%s", data.get("status"))
-            raise HTTPException(status_code=400, detail=f"Directions failed: {data.get('status')}")
-
-        if task.output and task.output.format == OutputFormat.TEXT:
+            raise ValueError(f"Directions failed: {data.get('status')}")
+        if output_format == "text":
             steps = []
             for route in data.get("routes", []):
                 for leg in route.get("legs", []):
@@ -337,39 +179,32 @@ class GoogleMapsService:
                         clean = re.sub(r"<[^>]+>", " ", step.get("html_instructions", ""))
                         clean = re.sub(r"\s+", " ", clean).strip()
                         steps.append(f"{i + 1}. {clean}")
-            return TaskOutput(format=OutputFormat.TEXT, content="\n".join(steps))
+            return {"directions": "\n".join(steps)}
+        return data
 
-        return TaskOutput(format=OutputFormat.JSON, content=data)
-
-    async def places_search(self, task: Task, client: httpx.AsyncClient) -> TaskOutput:
-        if task.input.format == InputFormat.TEXT:
-            params: Dict[str, Any] = {"query": task.input.content}
+    async def _places_search(self, fmt: str, content: Any, output_format: str | None, client: httpx.AsyncClient) -> dict:
+        if fmt == "text":
+            params: dict = {"query": content}
         else:
-            query = task.input.content.get("query")
-            location = task.input.content.get("location")
-            radius = task.input.content.get("radius", 5000)
+            query = content.get("query")
+            location = content.get("location")
+            radius = content.get("radius", 5000)
             params = {"query": query}
             if location:
                 params["location"] = f"{location.get('lat')},{location.get('lng')}"
                 params["radius"] = radius
-
         response = await client.get("/place/textsearch/json", params=params)
         data = response.json()
-
         if response.status_code != 200 or data.get("status") != "OK":
             logger.warning("Google Maps API error status=%s", data.get("status"))
-            raise HTTPException(status_code=400, detail=f"Places search failed: {data.get('status')}")
-
-        if task.output and task.output.format == OutputFormat.GEOJSON:
+            raise ValueError(f"Places search failed: {data.get('status')}")
+        if output_format == "application/geo+json":
             features = []
             for place in data.get("results", []):
                 loc = place.get("geometry", {}).get("location", {})
                 features.append({
                     "type": "Feature",
-                    "geometry": {
-                        "type": "Point",
-                        "coordinates": [loc.get("lng"), loc.get("lat")],
-                    },
+                    "geometry": {"type": "Point", "coordinates": [loc.get("lng"), loc.get("lat")]},
                     "properties": {
                         "name": place.get("name"),
                         "address": place.get("formatted_address"),
@@ -377,200 +212,371 @@ class GoogleMapsService:
                         "place_id": place.get("place_id"),
                     },
                 })
-            return TaskOutput(
-                format=OutputFormat.GEOJSON,
-                content={"type": "FeatureCollection", "features": features},
-            )
+            return {"type": "FeatureCollection", "features": features}
+        return data
 
-        return TaskOutput(format=OutputFormat.JSON, content=data)
-
-    async def place_details(self, task: Task, client: httpx.AsyncClient) -> TaskOutput:
-        if task.input.format != InputFormat.JSON:
-            raise HTTPException(status_code=400, detail="Place details requires JSON input")
-
-        place_id = task.input.content.get("place_id")
+    async def _place_details(self, fmt: str, content: Any, output_format: str | None, client: httpx.AsyncClient) -> dict:
+        if fmt != "application/json":
+            raise ValueError("Place details requires JSON input")
+        place_id = content.get("place_id")
         if not place_id:
-            raise HTTPException(status_code=400, detail="Place ID required")
-
+            raise ValueError("Place ID required")
         response = await client.get("/place/details/json", params={"place_id": place_id})
         data = response.json()
-
         if response.status_code != 200 or data.get("status") != "OK":
             logger.warning("Google Maps API error status=%s", data.get("status"))
-            raise HTTPException(status_code=400, detail=f"Place details failed: {data.get('status')}")
+            raise ValueError(f"Place details failed: {data.get('status')}")
+        return data
 
-        return TaskOutput(format=OutputFormat.JSON, content=data)
-
-    async def distance_matrix(self, task: Task, client: httpx.AsyncClient) -> TaskOutput:
-        if task.input.format != InputFormat.JSON:
-            raise HTTPException(status_code=400, detail="Distance matrix requires JSON input")
-
-        origins = task.input.content.get("origins", [])
-        destinations = task.input.content.get("destinations", [])
-        mode = task.input.content.get("mode", "driving")
-
+    async def _distance_matrix(self, fmt: str, content: Any, output_format: str | None, client: httpx.AsyncClient) -> dict:
+        if fmt != "application/json":
+            raise ValueError("Distance matrix requires JSON input")
+        origins = content.get("origins", [])
+        destinations = content.get("destinations", [])
         if not origins or not destinations:
-            raise HTTPException(status_code=400, detail="Origins and destinations required")
-
-        response = await client.get(
-            "/distancematrix/json",
-            params={
-                "origins": "|".join(origins),
-                "destinations": "|".join(destinations),
-                "mode": mode,
-            },
-        )
+            raise ValueError("Origins and destinations required")
+        mode = content.get("mode", "driving")
+        response = await client.get("/distancematrix/json", params={
+            "origins": "|".join(origins),
+            "destinations": "|".join(destinations),
+            "mode": mode,
+        })
         data = response.json()
-
         if response.status_code != 200 or data.get("status") != "OK":
             logger.warning("Google Maps API error status=%s", data.get("status"))
-            raise HTTPException(status_code=400, detail=f"Distance matrix failed: {data.get('status')}")
+            raise ValueError(f"Distance matrix failed: {data.get('status')}")
+        return data
 
-        return TaskOutput(format=OutputFormat.JSON, content=data)
+
+maps_service = GoogleMapsService(config.google_maps_api_key)
+
+# ---------------------------------------------------------------------------
+# A2A Agent Card
+# ---------------------------------------------------------------------------
+
+SKILL_DEFINITIONS = [
+    AgentSkill(
+        id="geocode",
+        name="Geocode",
+        description="Convert an address to latitude/longitude coordinates. Returns JSON or GeoJSON.",
+        tags=["maps", "geocoding", "coordinates"],
+        examples=[
+            "What are the coordinates for the Eiffel Tower?",
+            "Convert 350 Fifth Avenue New York NY to GPS coordinates",
+            "Where is O'Hare International Airport on a map?",
+            "Find the latitude and longitude of the Sydney Opera House",
+        ],
+        input_modes=["application/json", "text/plain"],
+        output_modes=["application/json", "application/geo+json"],
+    ),
+    AgentSkill(
+        id="reverse_geocode",
+        name="Reverse Geocode",
+        description="Convert latitude/longitude coordinates to a human-readable address.",
+        tags=["maps", "geocoding", "address"],
+        examples=[
+            "What address is at latitude 37.42 longitude -122.08?",
+            "What street is located at coordinates 40.7580, -73.9855?",
+            "What place is at GPS coordinates 48.8584, 2.2945?",
+        ],
+        input_modes=["application/json"],
+        output_modes=["application/json", "text/plain"],
+    ),
+    AgentSkill(
+        id="directions",
+        name="Directions",
+        description="Get driving, walking, or transit directions between two locations.",
+        tags=["maps", "directions", "navigation", "routing"],
+        examples=[
+            "How do I get from San Francisco to Los Angeles by car?",
+            "Give me step-by-step directions from Chicago to Milwaukee",
+            "What is the walking route from Central Park to the Metropolitan Museum?",
+            "How long does it take to drive from Seattle to Portland?",
+        ],
+        input_modes=["application/json"],
+        output_modes=["application/json", "text/plain"],
+    ),
+    AgentSkill(
+        id="places_search",
+        name="Places Search",
+        description="Search for places, businesses, and points of interest using Google Places.",
+        tags=["maps", "places", "search", "poi"],
+        examples=[
+            "Find Italian restaurants near Times Square New York",
+            "What hotels are close to LAX airport?",
+            "Search for pharmacies within a mile of downtown Chicago",
+            "Are there any parks near the Eiffel Tower?",
+        ],
+        input_modes=["application/json", "text/plain"],
+        output_modes=["application/json", "application/geo+json"],
+    ),
+    AgentSkill(
+        id="place_details",
+        name="Place Details",
+        description="Get detailed information about a specific place by its Google place_id.",
+        tags=["maps", "places", "details"],
+        examples=[
+            "What are the opening hours and phone number for the Louvre Museum?",
+            "Get full details about the Googleplex",
+            "What is the rating and website for the Empire State Building?",
+        ],
+        input_modes=["application/json"],
+        output_modes=["application/json"],
+    ),
+    AgentSkill(
+        id="distance_matrix",
+        name="Distance Matrix",
+        description="Calculate distances and travel times between multiple origins and destinations.",
+        tags=["maps", "distance", "travel-time", "matrix"],
+        examples=[
+            "How far is New York from Boston by car?",
+            "Compare driving times from Denver to Boulder, Fort Collins, and Colorado Springs",
+            "What is the travel distance and time from Miami to Orlando?",
+            "Calculate distances from our warehouse to all three delivery locations",
+        ],
+        input_modes=["application/json"],
+        output_modes=["application/json"],
+    ),
+]
+
+AGENT_CARD = AgentCard(
+    name="Google Maps A2A",
+    description=(
+        "An A2A Protocol v1 compliant agent providing Google Maps Platform capabilities: "
+        "geocoding, reverse geocoding, directions, places search, place details, and distance matrix."
+    ),
+    version="2.0.0",
+    documentation_url="https://github.com/yourusername/google-maps-a2a",
+    capabilities=AgentCapabilities(streaming=False, push_notifications=False),
+    default_input_modes=["application/json"],
+    default_output_modes=["application/json"],
+    supported_interfaces=[
+        AgentInterface(
+            url=f"{config.base_url.rstrip('/')}/",
+            protocol_binding="jsonrpc",
+            protocol_version="1.0",
+        )
+    ],
+    skills=SKILL_DEFINITIONS,
+)
+
+# Security scheme (informational — actual enforcement is via middleware)
+AGENT_CARD.security_schemes["apiKey"].CopyFrom(
+    SecurityScheme(
+        api_key_security_scheme=APIKeySecurityScheme(
+            name="X-API-Key",
+            location="header",
+            description="API key passed in X-API-Key HTTP header",
+        )
+    )
+)
+
+# ---------------------------------------------------------------------------
+# Input parsing helpers
+# ---------------------------------------------------------------------------
+
+def _make_data_part(result: dict) -> Part:
+    """Wrap a dict result as a protobuf Value data Part."""
+    v = Value()
+    v.struct_value.CopyFrom(json_format.ParseDict(result, Struct()))
+    return Part(data=v, media_type="application/json")
+
+
+def _parse_message_input(context: RequestContext) -> tuple[str, str, Any, str | None]:
+    """
+    Parse the incoming A2A message and return (task_type, fmt, content, output_format).
+
+    Accepts two formats from Kore AI:
+    1. Data part — a JSON object: {"type": "geocode", "input": {"format": "...", "content": ...}, "output": {"format": "..."}}
+    2. Text part — plain text passed as the content of a "geocode" skill based on skill_id hint
+    """
+    message = context.message
+    if not message or not message.parts:
+        raise ValueError("Message has no parts")
+
+    # Try data part first (structured input from Kore AI tool call)
+    for part in message.parts:
+        if part.HasField("data"):
+            try:
+                payload = json_format.MessageToDict(part.data)
+                task_type = payload.get("type") or payload.get("task_type")
+                inp = payload.get("input", {})
+                fmt = inp.get("format", "text")
+                content = inp.get("content", payload.get("content", ""))
+                output_format = payload.get("output", {}).get("format") if "output" in payload else None
+                if task_type:
+                    return task_type, fmt, content, output_format
+            except Exception:
+                pass
+
+    # Fall back to text part
+    text = context.get_user_input().strip()
+    if text:
+        # Try parsing text as JSON
+        try:
+            payload = json.loads(text)
+            task_type = payload.get("type") or payload.get("task_type")
+            inp = payload.get("input", {})
+            fmt = inp.get("format", "text")
+            content = inp.get("content", payload.get("content", ""))
+            output_format = payload.get("output", {}).get("format") if "output" in payload else None
+            if task_type:
+                return task_type, fmt, content, output_format
+        except json.JSONDecodeError:
+            pass
+        # Plain text — use as geocode content
+        return "geocode", "text", text, None
+
+    raise ValueError("Could not parse task type and input from message")
 
 
 # ---------------------------------------------------------------------------
-# IP allowlist middleware
+# A2A Agent Executor
 # ---------------------------------------------------------------------------
 
-class IPAllowlistMiddleware(BaseHTTPMiddleware):
-    """Restricts inbound requests to a set of allowed IP addresses.
+SUPPORTED_TASK_TYPES = frozenset({
+    "geocode", "reverse_geocode", "directions",
+    "places_search", "place_details", "distance_matrix",
+})
 
-    Controlled by the ALLOWED_IPS environment variable (comma-separated).
-    If ALLOWED_IPS is empty or unset, all IPs are allowed.
+
+class GoogleMapsAgentExecutor(AgentExecutor):
+    """Executes Google Maps tasks using the A2A v1 immediate Message response pattern.
+
+    Google Maps calls are synchronous and complete in a single round-trip, so we use
+    the A2A immediate response workflow: enqueue a single Message rather than going
+    through the Task lifecycle (submit → working → completed). This avoids the
+    requirement to enqueue a Task proto before sending TaskStatusUpdateEvent.
     """
 
-    def __init__(self, app: Any, allowed_ips: set) -> None:
-        super().__init__(app)
-        self._allowed_ips = allowed_ips
+    async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
+        from a2a.types.a2a_pb2 import Message as A2AMessage
 
-    async def dispatch(self, request: Request, call_next: Any) -> Any:
-        if self._allowed_ips and request.client.host not in self._allowed_ips:
+        try:
+            task_type, fmt, content, output_format = _parse_message_input(context)
+
+            if task_type not in SUPPORTED_TASK_TYPES:
+                raise ValueError(
+                    f"Unsupported task type: '{task_type}'. "
+                    f"Must be one of: {sorted(SUPPORTED_TASK_TYPES)}"
+                )
+
+            logger.info("Executing Google Maps task type=%s", task_type)
+            result = await maps_service.execute(task_type, fmt, content, output_format)
+            logger.info("Google Maps task completed type=%s", task_type)
+
+            response = A2AMessage(
+                message_id=str(uuid.uuid4()),
+                role=ROLE_AGENT,
+                task_id=context.task_id or "",
+                context_id=context.context_id or "",
+                parts=[_make_data_part(result)],
+            )
+
+        except Exception as e:
+            logger.error("Google Maps task failed: %s", e, exc_info=True)
+            response = A2AMessage(
+                message_id=str(uuid.uuid4()),
+                role=ROLE_AGENT,
+                task_id=context.task_id or "",
+                context_id=context.context_id or "",
+                parts=[Part(text=f"Error: {e.detail if isinstance(e, Exception) and hasattr(e, 'detail') else str(e)}")],
+            )
+
+        await event_queue.enqueue_event(response)
+
+    async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
+        logger.info("Cancel requested task_id=%s", context.task_id)
+        # Immediate-response agents have nothing to cancel; acknowledge gracefully.
+        from a2a.types.a2a_pb2 import Message as A2AMessage
+        response = A2AMessage(
+            message_id=str(uuid.uuid4()),
+            role=ROLE_AGENT,
+            task_id=context.task_id or "",
+            context_id=context.context_id or "",
+            parts=[Part(text="Task cancelled.")],
+        )
+        await event_queue.enqueue_event(response)
+
+
+# ---------------------------------------------------------------------------
+# Authentication and IP middleware
+# ---------------------------------------------------------------------------
+
+_UNAUTHENTICATED_PATHS = frozenset({
+    "/.well-known/agent-card.json",
+    "/health",
+    "/",  # OPTIONS preflight
+})
+
+
+class SecurityMiddleware(BaseHTTPMiddleware):
+    """Validates X-API-Key and optionally enforces IP allowlist."""
+
+    async def dispatch(self, request: Request, call_next: Any) -> Response:
+        # IP allowlist (if configured)
+        if config.allowed_ip_set and request.client.host not in config.allowed_ip_set:
             logger.warning("Request rejected: IP %s not in allowlist", request.client.host)
             return JSONResponse({"detail": "Forbidden"}, status_code=403)
+
+        # Skip auth for public endpoints
+        if request.url.path in _UNAUTHENTICATED_PATHS and request.method in ("GET", "OPTIONS"):
+            return await call_next(request)
+
+        # API key validation for all other requests
+        api_key = request.headers.get("X-API-Key")
+        if not api_key:
+            logger.warning("Authentication failed: missing X-API-Key header")
+            return JSONResponse({"detail": "Missing API key"}, status_code=403)
+        if not hmac.compare_digest(api_key, config.api_key):
+            logger.warning("Authentication failed: invalid API key")
+            return JSONResponse({"detail": "Invalid API key"}, status_code=401)
+
         return await call_next(request)
 
 
 # ---------------------------------------------------------------------------
-# Module-level singletons
+# Request handler and routes
 # ---------------------------------------------------------------------------
 
-task_repo = TaskRepository()
-maps_service = GoogleMapsService(config.google_maps_api_key)
+task_store = InMemoryTaskStore()
+
+request_handler = DefaultRequestHandler(
+    agent_executor=GoogleMapsAgentExecutor(),
+    task_store=task_store,
+    agent_card=AGENT_CARD,
+)
+
+jsonrpc_routes = create_jsonrpc_routes(request_handler, rpc_url="/")
+
+AGENT_CARD_DICT = json_format.MessageToDict(AGENT_CARD)
+
+
+async def get_well_known_agent_card(request: Request) -> JSONResponse:
+    """A2A v1 standard discovery endpoint."""
+    return JSONResponse(AGENT_CARD_DICT)
+
+
+async def health(request: Request) -> JSONResponse:
+    return JSONResponse({"status": "ok"})
+
+
+# ---------------------------------------------------------------------------
+# Application
+# ---------------------------------------------------------------------------
 
 logger.info("Google Maps A2A Server starting log_level=%s", config.log_level)
 
-# ---------------------------------------------------------------------------
-# FastAPI application
-# ---------------------------------------------------------------------------
-
-app = FastAPI(title="Google Maps A2A Server")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+app = Starlette(
+    routes=[
+        Route("/health", health, methods=["GET"]),
+        Route("/.well-known/agent-card.json", get_well_known_agent_card, methods=["GET"]),
+        *jsonrpc_routes,
+    ],
+    middleware=[
+        Middleware(SecurityMiddleware),
+    ],
 )
-
-if config.allowed_ip_set:
-    app.add_middleware(IPAllowlistMiddleware, allowed_ips=config.allowed_ip_set)
-    logger.info("IP allowlist active: %s", config.allowed_ip_set)
-
-# ---------------------------------------------------------------------------
-# Authentication
-# ---------------------------------------------------------------------------
-
-api_key_header = APIKeyHeader(name="X-API-Key")
-
-
-async def verify_api_key(api_key: str = Depends(api_key_header)) -> str:
-    if api_key != config.api_key:
-        logger.warning("Authentication failed: invalid API key")
-        raise HTTPException(status_code=401, detail="Invalid API key")
-    return api_key
-
-
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
-
-@app.get("/")
-async def root() -> Dict[str, str]:
-    return {"message": "Google Maps A2A Server", "version": "1.0.0"}
-
-
-@app.get("/health")
-async def health() -> Dict[str, str]:
-    return {"status": "ok"}
-
-
-@app.get("/agent-card")
-async def get_agent_card() -> Dict[str, Any]:
-    return AGENT_CARD
-
-
-@app.get("/.well-known/agent.json")
-async def get_well_known_agent() -> Dict[str, Any]:
-    """A2A protocol standard discovery endpoint."""
-    return AGENT_CARD
-
-
-@app.post("/tasks", response_model=Task, dependencies=[Depends(verify_api_key)])
-async def create_task(task: Task) -> Task:
-    logger.info("Task created id=%s type=%s", task.id, task.type)
-    return task_repo.save(task)
-
-
-@app.get("/tasks/{task_id}", response_model=Task, dependencies=[Depends(verify_api_key)])
-async def get_task(task_id: str) -> Task:
-    return task_repo.require(task_id)
-
-
-@app.put("/tasks/{task_id}/execute", response_model=Task, dependencies=[Depends(verify_api_key)])
-async def execute_task(task_id: str) -> Task:
-    task = task_repo.require(task_id)
-    task.status = TaskStatus.IN_PROGRESS
-    task.updated_at = datetime.now().isoformat()
-    logger.info("Task executing id=%s type=%s", task.id, task.type)
-    try:
-        task.output = await maps_service.execute(task)
-        task.status = TaskStatus.COMPLETED
-        logger.info("Task completed id=%s", task.id)
-    except Exception as e:
-        logger.error("Task failed id=%s", task.id, exc_info=True)
-        task.status = TaskStatus.FAILED
-        task.output = TaskOutput(
-            format=OutputFormat.TEXT,
-            content=f"Error executing task: {e.detail if isinstance(e, HTTPException) else str(e)}",
-        )
-    task.updated_at = datetime.now().isoformat()
-    task_repo.save(task)
-    return task
-
-
-@app.post("/tasks/run", response_model=Task, dependencies=[Depends(verify_api_key)])
-async def run_task(task: Task) -> Task:
-    """Create and execute a task in a single request (primary Kore AI integration endpoint)."""
-    task.status = TaskStatus.IN_PROGRESS
-    task.updated_at = datetime.now().isoformat()
-    logger.info("Task run (single-step) id=%s type=%s", task.id, task.type)
-    try:
-        task.output = await maps_service.execute(task)
-        task.status = TaskStatus.COMPLETED
-        logger.info("Task run completed id=%s", task.id)
-    except Exception as e:
-        logger.error("Task run failed id=%s", task.id, exc_info=True)
-        task.status = TaskStatus.FAILED
-        task.output = TaskOutput(
-            format=OutputFormat.TEXT,
-            content=f"Error executing task: {e.detail if isinstance(e, HTTPException) else str(e)}",
-        )
-    task.updated_at = datetime.now().isoformat()
-    task_repo.save(task)
-    return task
-
 
 if __name__ == "__main__":  # pragma: no cover
     import uvicorn

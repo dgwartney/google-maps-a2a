@@ -4,8 +4,7 @@
 
 - [Environment Variables](#environment-variables)
 - [Endpoints](#endpoints)
-- [Single-step vs Two-step Flow](#single-step-vs-two-step-flow)
-- [Authentication](#authentication)
+- [A2A Protocol v1 — Making Requests](#a2a-protocol-v1--making-requests)
 - [Task Types](#task-types)
 - [Error Handling](#error-handling)
 
@@ -30,135 +29,195 @@ Copy `.env.example` to `.env` and fill in the required values before running loc
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/` | GET | Server info and version |
 | `/health` | GET | Health check — returns `{"status":"ok"}` |
-| `/agent-card` | GET | Capability discovery (lists all task types and auth scheme) |
-| `/docs` | GET | Interactive Swagger UI |
+| `/.well-known/agent-card.json` | GET | **A2A v1 capability discovery** — lists all 6 skills and auth scheme |
 
-### Authenticated (require `X-API-Key` header)
+### Authenticated (require `X-API-Key` + `A2A-Version: 1.0` headers)
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/tasks` | POST | Create a task (status: `created`) |
-| `/tasks/{task_id}` | GET | Fetch a task and its result |
-| `/tasks/{task_id}/execute` | PUT | Execute a previously created task |
-| `/tasks/run` | POST | **Create + execute in a single request** |
+| `/` | POST | **JSON-RPC 2.0** — all agent operations via `SendMessage` method |
 
 ---
 
-## Single-step vs Two-step Flow
+## A2A Protocol v1 — Making Requests
 
-### Single-step: `POST /tasks/run` (recommended for simple integrations)
+This server implements [A2A Protocol v1.0](https://github.com/a2aproject/A2A) using **JSON-RPC 2.0 over HTTP**.
 
-Creates and executes the task synchronously, returning the completed result in one call.
+### Required headers
+
+```
+X-API-Key: <your API key>
+Content-Type: application/json
+A2A-Version: 1.0
+```
+
+### Request format
+
+All operations use `POST /` with the `SendMessage` method:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "<unique-request-id>",
+  "method": "SendMessage",
+  "params": {
+    "message": {
+      "messageId": "<uuid>",
+      "role": "ROLE_USER",
+      "parts": [
+        {
+          "data": {
+            "type": "<task-type>",
+            "input": {
+              "format": "<input-format>",
+              "content": "<string or object>"
+            }
+          },
+          "mediaType": "application/json"
+        }
+      ]
+    }
+  }
+}
+```
+
+### Response format
+
+On success, the result is in `result.message.parts[0].data`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "<request-id>",
+  "result": {
+    "message": {
+      "role": "ROLE_AGENT",
+      "parts": [
+        {
+          "data": { ...Google Maps API result... },
+          "mediaType": "application/json"
+        }
+      ]
+    }
+  }
+}
+```
+
+On error, the result message part is a text string:
+
+```json
+{
+  "result": {
+    "message": {
+      "parts": [{ "text": "Error: Geocoding failed: ZERO_RESULTS" }]
+    }
+  }
+}
+```
+
+### Example — geocode via curl
 
 ```bash
-curl -X POST http://localhost:8000/tasks/run \
-  -H "X-API-Key: your_api_key_here" \
+curl -X POST https://google-maps-a2a.fly.dev/ \
+  -H "X-API-Key: <your-key>" \
   -H "Content-Type: application/json" \
+  -H "A2A-Version: 1.0" \
   -d '{
-    "type": "geocode",
-    "input": {"format": "text", "content": "Times Square, New York"}
+    "jsonrpc": "2.0",
+    "id": "1",
+    "method": "SendMessage",
+    "params": {
+      "message": {
+        "messageId": "m1",
+        "role": "ROLE_USER",
+        "parts": [{
+          "data": {
+            "type": "geocode",
+            "input": {"format": "text", "content": "1600 Amphitheatre Parkway, Mountain View, CA"}
+          },
+          "mediaType": "application/json"
+        }]
+      }
+    }
   }'
 ```
-
-Response: a completed `Task` object with `status: "completed"` and result in `output.content`.
-
-### Two-step: `POST /tasks` → `PUT /tasks/{id}/execute` (standard A2A protocol)
-
-Allows task creation and execution to be decoupled. Use when the caller follows the A2A specification strictly.
-
-```bash
-# Step 1 — create
-curl -X POST http://localhost:8000/tasks \
-  -H "X-API-Key: your_api_key_here" \
-  -H "Content-Type: application/json" \
-  -d '{"type":"geocode","input":{"format":"text","content":"Times Square, New York"}}'
-
-# Step 2 — execute (use the id from step 1 response)
-curl -X PUT http://localhost:8000/tasks/<task_id>/execute \
-  -H "X-API-Key: your_api_key_here"
-```
-
----
-
-## Authentication
-
-All endpoints except `/`, `/health`, `/agent-card`, and `/docs` require:
-
-```
-X-API-Key: <your API_KEY value>
-```
-
-Missing key → `403 Forbidden`
-Wrong key → `401 Unauthorized`
 
 ---
 
 ## Task Types
 
-All examples below use the single-step `/tasks/run` endpoint.
+All 6 task types use the same JSON-RPC `SendMessage` envelope. Only the `data` payload changes.
 
 ### geocode — Address → coordinates
 
 Input formats: `text`, `application/json`
-Output formats: `application/json`, `application/geo+json`
+Output formats: `application/json` (default), `application/geo+json`
 
 ```json
-{"type":"geocode","input":{"format":"text","content":"1600 Amphitheatre Pkwy, Mountain View, CA"}}
+{"type": "geocode", "input": {"format": "text", "content": "Times Square, New York"}}
 ```
 
 ```json
-{"type":"geocode","input":{"format":"application/json","content":{"address":"1600 Amphitheatre Pkwy"}}}
+{"type": "geocode", "input": {"format": "application/json", "content": {"address": "Times Square"}}}
 ```
 
-Request GeoJSON output by including `output` in the body:
+Request GeoJSON output by adding an `output` field:
 
 ```json
 {
   "type": "geocode",
-  "input": {"format":"text","content":"Times Square, New York"},
-  "output": {"format":"application/geo+json","content":""}
+  "input": {"format": "text", "content": "Times Square, New York"},
+  "output": {"format": "application/geo+json"}
 }
 ```
+
+Result path: `result.message.parts[0].data.results[0].geometry.location` → `{lat, lng}`
 
 ---
 
 ### reverse_geocode — Coordinates → address
 
 Input format: `application/json` (requires `lat` and `lng`)
-Output formats: `application/json`, `text`
+Output formats: `application/json` (default), `text`
 
 ```json
-{"type":"reverse_geocode","input":{"format":"application/json","content":{"lat":37.4224764,"lng":-122.0842499}}}
+{
+  "type": "reverse_geocode",
+  "input": {"format": "application/json", "content": {"lat": 37.4224864, "lng": -122.0855962}}
+}
 ```
+
+Result path: `result.message.parts[0].data.results[0].formatted_address`
 
 ---
 
 ### directions — Route planning
 
 Input format: `application/json` (requires `origin` and `destination`; optional `mode`: `driving` | `walking` | `transit` | `bicycling`)
-Output formats: `application/json`, `text`
+Output formats: `application/json` (default), `text` (numbered step list)
 
 ```json
 {
   "type": "directions",
   "input": {
     "format": "application/json",
-    "content": {"origin":"San Francisco, CA","destination":"Los Angeles, CA","mode":"driving"}
+    "content": {"origin": "San Francisco, CA", "destination": "Los Angeles, CA", "mode": "driving"}
   }
 }
 ```
 
+Result path: `result.message.parts[0].data.routes[0].legs[0]` → distance, duration, steps
+
 ---
 
-### places_search — Search for POIs
+### places_search — Search for places
 
 Input formats: `text` (search query), `application/json` (query + optional location/radius)
-Output formats: `application/json`, `application/geo+json`
+Output formats: `application/json` (default), `application/geo+json`
 
 ```json
-{"type":"places_search","input":{"format":"text","content":"coffee shops near Union Square San Francisco"}}
+{"type": "places_search", "input": {"format": "text", "content": "coffee shops near Union Square SF"}}
 ```
 
 ```json
@@ -175,16 +234,23 @@ Output formats: `application/json`, `application/geo+json`
 }
 ```
 
+Result path: `result.message.parts[0].data.results[]` → array of places
+
 ---
 
-### place_details — Full info for a place
+### place_details — Full details for a place
 
 Input format: `application/json` (requires `place_id`)
 Output format: `application/json`
 
 ```json
-{"type":"place_details","input":{"format":"application/json","content":{"place_id":"ChIJ2eUgeAK6j4ARbn5u_wAGqWA"}}}
+{
+  "type": "place_details",
+  "input": {"format": "application/json", "content": {"place_id": "ChIJ2eUgeAK6j4ARbn5u_wAGqWA"}}
+}
 ```
+
+Result path: `result.message.parts[0].data.result` → name, address, hours, rating, etc.
 
 ---
 
@@ -207,30 +273,30 @@ Output format: `application/json`
 }
 ```
 
+Result path: `result.message.parts[0].data.rows[i].elements[j]` → distance, duration per pair
+
 ---
 
 ## Error Handling
 
-| HTTP status | Meaning |
-|-------------|---------|
-| `200` | Success |
-| `400` | Bad request (invalid input or Google Maps API error) |
+### HTTP-level errors
+
+| Status | Meaning |
+|--------|---------|
+| `200` | Request processed (check `result` vs `error` field in JSON-RPC response) |
 | `401` | Invalid `X-API-Key` |
 | `403` | Missing `X-API-Key` or IP not in allowlist |
-| `404` | Task not found |
-| `422` | Request body validation failed (Pydantic) |
-| `500` | Internal server error |
 
-When a task execution fails (e.g., Google Maps returns an error), the task status is set to `"failed"` and the error message is in `output.content`. The HTTP response is still `200`.
+### JSON-RPC errors (HTTP 200, `error` field present)
 
-```json
-{
-  "id": "...",
-  "type": "geocode",
-  "status": "failed",
-  "output": {
-    "format": "text",
-    "content": "Error executing task: Geocoding failed: ZERO_RESULTS"
-  }
-}
-```
+| Code | Meaning |
+|------|---------|
+| `-32601` | Method not found |
+| `-32602` | Invalid params |
+| `-32009` | A2A version not supported (include `A2A-Version: 1.0` header) |
+
+### Application errors (HTTP 200, `result.message.parts[0].text`)
+
+When a task fails (e.g., invalid input, Google Maps API error), the response is still HTTP 200 with a JSON-RPC success result, but the message part contains a `text` field with the error description instead of a `data` field.
+
+Always check whether `parts[0]` has `data` (success) or `text` (error) before extracting the result.

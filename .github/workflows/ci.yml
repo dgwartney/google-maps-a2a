@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Run unit tests with coverage
+        run: uv run pytest tests/test_server.py -v --cov=main --cov-report=term-missing --cov-fail-under=95
+        env:
+          API_KEY: test_api_key
+          GOOGLE_MAPS_API_KEY: test_google_maps_api_key
+          LOG_LEVEL: DEBUG

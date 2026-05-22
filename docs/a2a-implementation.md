@@ -1,138 +1,178 @@
-# A2A Protocol Implementation Details
+# A2A Protocol v1 Implementation Details
 
-This document provides information about how the Google Maps A2A server implements the [Agent2Agent (A2A) protocol](https://github.com/google/A2A).
+This document describes how the Google Maps A2A Server implements the [A2A Protocol v1.0](https://github.com/a2aproject/A2A) specification.
 
 ## Protocol Overview
 
-The Agent2Agent (A2A) protocol is a specification created by Google for enabling communication between AI agents. It defines a standardized way for agents to:
+The Agent2Agent (A2A) protocol is an open standard under the Linux Foundation (contributed by Google) for enabling interoperability between AI agent systems. It defines:
 
-1. Discover each other's capabilities
-2. Submit tasks for execution
-3. Monitor task progress
-4. Receive task results
+1. A standard discovery mechanism (well-known agent card URL)
+2. A JSON-RPC 2.0 transport binding
+3. A message-based interaction model with typed parts
+4. A task lifecycle for long-running operations
+5. Standard security scheme declarations
 
-## Key Components
+This server is built on the official [a2a-sdk](https://github.com/a2aproject/a2a-python) Python library and is fully compliant with A2A v1.0.
 
-### Agent Card
+---
 
-The agent card is a JSON document that describes the agent's capabilities, input/output formats, and authentication requirements. It's available at the `/agent-card` endpoint:
+## Agent Card
+
+The agent card is served at the A2A v1 standard well-known URL:
+
+```
+GET /.well-known/agent-card.json
+```
+
+No authentication required. The card is generated from the protobuf `AgentCard` type and serialized to JSON:
 
 ```json
 {
-  "schema_version": "v1",
   "name": "Google Maps A2A",
-  "description": "An A2A-compliant agent that provides Google Maps capabilities",
-  "version": "1.0.0",
-  "contact": "https://github.com/pab1it0/google-maps-a2a",
-  "auth": {
-    "type": "api_key",
-    "header_name": "X-API-Key"
-  },
-  "input_formats": [
-    {"format": "text", "description": "Natural language query for maps operations"},
-    {"format": "application/json", "description": "Structured data for maps operations"}
-  ],
-  "output_formats": [
-    {"format": "text", "description": "Text response with maps information"},
-    {"format": "application/json", "description": "JSON response with structured maps data"},
-    {"format": "application/geo+json", "description": "GeoJSON formatted location data"}
-  ],
-  "tasks": [
+  "description": "An A2A Protocol v1 compliant agent providing Google Maps Platform capabilities",
+  "version": "2.0.0",
+  "supportedInterfaces": [
     {
-      "type": "geocode",
-      "description": "Convert addresses to latitude and longitude coordinates",
-      "input_formats": ["text", "application/json"],
-      "output_formats": ["application/json", "application/geo+json"]
+      "url": "https://google-maps-a2a.fly.dev/",
+      "protocolBinding": "jsonrpc",
+      "protocolVersion": "1.0"
+    }
+  ],
+  "capabilities": {
+    "streaming": false,
+    "pushNotifications": false
+  },
+  "defaultInputModes": ["application/json"],
+  "defaultOutputModes": ["application/json"],
+  "securitySchemes": {
+    "apiKey": {
+      "apiKeySecurityScheme": {
+        "name": "X-API-Key",
+        "location": "header",
+        "description": "API key passed in X-API-Key HTTP header"
+      }
+    }
+  },
+  "skills": [
+    {
+      "id": "geocode",
+      "name": "Geocode",
+      "description": "Convert an address to latitude/longitude coordinates",
+      "tags": ["maps", "geocoding", "coordinates"],
+      "inputModes": ["application/json", "text/plain"],
+      "outputModes": ["application/json", "application/geo+json"]
     },
-    // Other tasks...
+    ...
   ]
 }
 ```
 
-### Tasks
+---
 
-Tasks are the primary unit of work in the A2A protocol. Each task has:
+## Endpoint Structure
 
-- A unique ID
-- A type (e.g., "geocode", "directions")
-- Status (created, in_progress, completed, or failed)
-- Input data with format
-- Output data with format
-- Timestamps for creation and updates
+| Path | Method | Auth | Description |
+|------|--------|------|-------------|
+| `/.well-known/agent-card.json` | GET | No | A2A v1 capability discovery |
+| `/health` | GET | No | Health check (fly.io monitoring) |
+| `/` | POST | Yes | JSON-RPC 2.0 — all A2A operations |
 
-The task lifecycle is:
-
-1. **Creation**: Client submits a task to the `/tasks` endpoint
-2. **Execution**: Client requests execution via `/tasks/{task_id}/execute`
-3. **Status Checking**: Client checks status via `/tasks/{task_id}`
-4. **Result Retrieval**: Client uses the same endpoint to retrieve results
-
-### Input/Output Formats
-
-Our implementation supports multiple input and output formats:
-
-| Format | Description |
-|--------|-------------|
-| `text` | Plain text for simple inputs and outputs |
-| `application/json` | Structured JSON data |
-| `application/geo+json` | GeoJSON format for geographic data |
-| `text/markdown` | Markdown-formatted text |
-
-## A2A Protocol Implementation
-
-### Endpoint Structure
-
-Our implementation follows the HTTP/JSON-RPC approach with these endpoints:
-
-- `GET /agent-card`: Provides the agent descriptor
-- `POST /tasks`: Creates a new task
-- `GET /tasks/{task_id}`: Retrieves task status and results
-- `PUT /tasks/{task_id}/execute`: Executes a task
-
-### Authentication
-
-We use API key authentication as specified in the A2A protocol. Clients must include the API key in the `X-API-Key` header for all endpoints except `/agent-card`.
-
-### Task Execution Model
-
-Tasks in our implementation follow this flow:
-
-1. Task creation establishes the task type and input
-2. Task execution processes the input and performs the specified operation
-3. Task status updates as progress occurs
-4. Task output is populated with results in the requested format
-
-## Extending the Implementation
-
-To add new task types to the server:
-
-1. Add the task to the `AGENT_CARD` in `main.py`
-2. Create a handler function following the pattern of existing handlers
-3. Update the execution dispatch logic in `execute_task`
-
-## Differences from A2A Specification
-
-Our implementation closely follows the A2A protocol with a few enhancements:
-
-1. **Additional Output Formats**: We support GeoJSON for geographic data
-2. **Task Input**: We directly include task input in the creation request
-3. **Execution Endpoint**: We use a dedicated endpoint for task execution
-
-## Future Improvements
-
-To further enhance A2A compliance:
-
-1. Add WebSocket support for real-time status updates
-2. Implement persistent storage for tasks
-3. Add fine-grained authentication and authorization
-4. Support agent-to-agent discovery mechanisms
+All agent operations use a single `POST /` endpoint with JSON-RPC 2.0 method dispatch.
 
 ---
 
-## Non-standard Extension: `POST /tasks/run`
+## Supported JSON-RPC Methods
 
-This server adds `POST /tasks/run` as a convenience endpoint not defined in the A2A specification.
+| Method | Description |
+|--------|-------------|
+| `SendMessage` | Send a message and receive an immediate response |
+| `GetTask` | Retrieve a task by ID |
+| `ListTasks` | List tasks |
+| `CancelTask` | Cancel a task |
 
-It combines task creation and execution into a single synchronous HTTP request, returning the completed (or failed) task in one response. This is intended for callers that cannot make two sequential requests per operation — for example, the Kore AI Agent Platform v1, which calls external tools as single HTTP requests.
+All methods require the `A2A-Version: 1.0` header.
 
-Standard A2A clients should continue using the two-step flow (`POST /tasks` → `PUT /tasks/{id}/execute`) for full protocol compliance. See [usage.md](usage.md) for details on both flows.
+---
+
+## Message and Response Format
+
+### Input (skill invocation)
+
+The `SendMessage` params contain a `Message` with `parts[]`. Each part has a `data` field (protobuf Value/Struct) containing the skill input:
+
+```json
+{
+  "message": {
+    "messageId": "<uuid>",
+    "role": "ROLE_USER",
+    "parts": [{
+      "data": {
+        "type": "<skill-id>",
+        "input": {"format": "<fmt>", "content": <value>},
+        "output": {"format": "<fmt>"}
+      },
+      "mediaType": "application/json"
+    }]
+  }
+}
+```
+
+### Output (immediate Message response)
+
+Google Maps calls complete synchronously, so this server uses the A2A v1 **immediate Message response** pattern. The `SendMessageResponse` contains a `message` (not a `task`):
+
+```json
+{
+  "result": {
+    "message": {
+      "role": "ROLE_AGENT",
+      "parts": [{"data": { ...Google Maps result... }, "mediaType": "application/json"}]
+    }
+  }
+}
+```
+
+On error, the part contains `text` instead of `data`.
+
+---
+
+## Authentication
+
+The server uses API key authentication declared in `securitySchemes`. The `X-API-Key` header is validated by Starlette middleware before requests reach the A2A handler. Missing or invalid keys return HTTP 403/401 before any JSON-RPC processing occurs.
+
+---
+
+## Skills
+
+All 6 Google Maps capabilities are declared as A2A v1 `AgentSkill` objects with:
+- `id` — used in the `type` field of the input data
+- `name`, `description`, `tags`, `examples`
+- `inputModes`, `outputModes`
+
+See [usage.md](usage.md) for request/response examples for each skill.
+
+---
+
+## Implementation Notes
+
+### Immediate response pattern
+
+All Google Maps API calls complete in a single round-trip (~100–500ms). The A2A v1 spec supports two patterns:
+
+- **Immediate response**: Enqueue a `Message` object — returns synchronously in the `SendMessage` response
+- **Long-running task**: Enqueue a `Task` object, then send `TaskStatusUpdateEvent` / `TaskArtifactUpdateEvent`
+
+This server uses the **immediate response** pattern because all Google Maps calls complete synchronously. A2A clients receive a `message` in the `SendMessageResponse` rather than a `task`.
+
+### SDK
+
+Built on [a2a-sdk](https://pypi.org/project/a2a-sdk/) v1.0.3+. The `GoogleMapsAgentExecutor` implements `AgentExecutor.execute()` and `AgentExecutor.cancel()`. The `DefaultRequestHandler` and `create_jsonrpc_routes()` wire up the JSON-RPC dispatch layer.
+
+---
+
+## Future Improvements
+
+1. Add streaming support (`SendStreamingMessage`) for progressive result delivery
+2. Implement persistent task storage (database-backed `TaskStore`) for multi-machine deployments
+3. Add push notification support for webhook-based result delivery
+4. Support `GetExtendedAgentCard` for authenticated capability discovery

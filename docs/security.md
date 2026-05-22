@@ -6,7 +6,7 @@ This document covers all configurable security features built into the server.
 
 ## API Key Authentication
 
-All endpoints except `/`, `/health`, `/agent-card`, and `/docs` require an `X-API-Key` header.
+All endpoints except `/.well-known/agent-card.json` and `/health` require an `X-API-Key` header.
 
 ### Choosing a strong key
 
