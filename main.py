@@ -424,6 +424,15 @@ def _parse_message_input(context: RequestContext) -> tuple[str, str, Any, str | 
                 return task_type, fmt, content, output_format
         except json.JSONDecodeError:
             pass
+        # Detect bare coordinates in text → reverse_geocode
+        # Matches patterns like "35.6762, 139.6503" or "35.6762 139.6503"
+        coord_match = re.search(
+            r'(-?\d{1,3}\.\d+)[,\s]+(-?\d{1,3}\.\d+)', text
+        )
+        if coord_match:
+            lat, lng = float(coord_match.group(1)), float(coord_match.group(2))
+            if -90 <= lat <= 90 and -180 <= lng <= 180:
+                return "reverse_geocode", "application/json", {"lat": lat, "lng": lng}, None
         # Plain text — use as geocode content
         return "geocode", "text", text, None
 
