@@ -346,7 +346,7 @@ AGENT_CARD = AgentCard(
         "geocoding, reverse geocoding, directions, places search, place details, and distance matrix."
     ),
     version="2.0.0",
-    documentation_url="https://github.com/yourusername/google-maps-a2a",
+    documentation_url="https://github.com/dgwartney/google-maps-a2a",
     capabilities=AgentCapabilities(streaming=False, push_notifications=False),
     default_input_modes=["application/json"],
     default_output_modes=["application/json"],
