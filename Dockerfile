@@ -8,13 +8,14 @@ WORKDIR /app
 # Copy dependency files first for layer cache optimization
 COPY pyproject.toml uv.lock ./
 
-# Install runtime deps into system Python (UV_SYSTEM_PYTHON avoids venv startup issues)
-ENV UV_SYSTEM_PYTHON=1
-RUN uv sync --frozen --no-dev --no-cache
+# Export pinned deps from uv.lock and install to system Python with pip
+# (avoids venv startup recreation issues with uv run)
+RUN uv export --frozen --no-dev --no-hashes -o /tmp/requirements.txt && \
+    pip install --no-cache-dir -r /tmp/requirements.txt
 
 # Copy application code
 COPY . .
 
 EXPOSE 8000
 
-CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
