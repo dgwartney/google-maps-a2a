@@ -8,10 +8,11 @@ WORKDIR /app
 # Copy dependency files first for layer cache optimization
 COPY pyproject.toml uv.lock ./
 
-# Export pinned deps from uv.lock and install to system Python with pip
-# (avoids venv startup recreation issues with uv run)
-RUN uv export --frozen --no-dev --no-hashes -o /tmp/requirements.txt && \
-    pip install --no-cache-dir -r /tmp/requirements.txt
+# Create venv and install runtime deps using uv (matches lock file Python version)
+RUN uv sync --frozen --no-dev --no-cache
+
+# Add venv to PATH — uvicorn in CMD resolves to .venv/bin/uvicorn
+ENV PATH="/app/.venv/bin:$PATH"
 
 # Copy application code
 COPY . .
