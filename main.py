@@ -8,15 +8,11 @@ Framework:   a2a-sdk + Starlette
 """
 
 import hmac
-import json
 import logging
-import re
-import uuid
+import os
 from typing import Any
 
 import httpx
-from a2a.server.agent_execution import AgentExecutor, RequestContext
-from a2a.server.events import EventQueue
 from a2a.server.request_handlers import DefaultRequestHandler
 from a2a.server.routes.jsonrpc_routes import create_jsonrpc_routes
 from a2a.server.tasks import InMemoryTaskStore
@@ -26,12 +22,9 @@ from a2a.types.a2a_pb2 import (
     AgentCard,
     AgentInterface,
     AgentSkill,
-    Part,
-    ROLE_AGENT,
     SecurityScheme,
 )
 from google.protobuf import json_format
-from google.protobuf.struct_pb2 import Struct, Value
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from starlette.applications import Starlette
@@ -52,6 +45,7 @@ class Config(BaseSettings):
 
     api_key: str = ""
     google_maps_api_key: str = ""
+    google_api_key: str = ""
     log_level: str = "INFO"
     allowed_ips: str = ""
     base_url: str = "https://google-maps-a2a.fly.dev"
@@ -61,6 +55,15 @@ class Config(BaseSettings):
     def google_maps_key_must_be_set(cls, v: str) -> str:
         if not v:
             raise ValueError("GOOGLE_MAPS_API_KEY must be set before starting the server")
+        return v
+
+    @field_validator("google_api_key")
+    @classmethod
+    def google_api_key_must_be_set(cls, v: str) -> str:
+        if not v:
+            raise ValueError(
+                "GOOGLE_API_KEY must be set. Get from https://aistudio.google.com/app/apikey"
+            )
         return v
 
     @field_validator("log_level")
@@ -78,6 +81,9 @@ class Config(BaseSettings):
 
 
 config = Config()
+
+# Set GOOGLE_API_KEY before importing ADK modules (ADK reads this at import time)
+os.environ["GOOGLE_API_KEY"] = config.google_api_key
 
 logging.basicConfig(
     level=getattr(logging, config.log_level, logging.INFO),
@@ -250,6 +256,12 @@ class GoogleMapsService:
 
 maps_service = GoogleMapsService(config.google_maps_api_key)
 
+# Import ADK agent and executor after GOOGLE_API_KEY env var is set
+from agent import GoogleMapsAgent  # noqa: E402
+from agent_executor import GoogleMapsAgentExecutor  # noqa: E402
+
+maps_agent = GoogleMapsAgent(maps_service)
+
 # ---------------------------------------------------------------------------
 # A2A Agent Card
 # ---------------------------------------------------------------------------
@@ -372,143 +384,6 @@ AGENT_CARD.security_schemes["apiKey"].CopyFrom(
 )
 
 # ---------------------------------------------------------------------------
-# Input parsing helpers
-# ---------------------------------------------------------------------------
-
-def _make_data_part(result: dict) -> Part:
-    """Wrap a dict result as a protobuf Value data Part."""
-    v = Value()
-    v.struct_value.CopyFrom(json_format.ParseDict(result, Struct()))
-    return Part(data=v, media_type="application/json")
-
-
-def _parse_message_input(context: RequestContext) -> tuple[str, str, Any, str | None]:
-    """
-    Parse the incoming A2A message and return (task_type, fmt, content, output_format).
-
-    Accepts two formats from Kore AI:
-    1. Data part — a JSON object: {"type": "geocode", "input": {"format": "...", "content": ...}, "output": {"format": "..."}}
-    2. Text part — plain text passed as the content of a "geocode" skill based on skill_id hint
-    """
-    message = context.message
-    if not message or not message.parts:
-        raise ValueError("Message has no parts")
-
-    # Try data part first (structured input from Kore AI tool call)
-    for part in message.parts:
-        if part.HasField("data"):
-            try:
-                payload = json_format.MessageToDict(part.data)
-                task_type = payload.get("type") or payload.get("task_type")
-                inp = payload.get("input", {})
-                fmt = inp.get("format", "text")
-                content = inp.get("content", payload.get("content", ""))
-                output_format = payload.get("output", {}).get("format") if "output" in payload else None
-                if task_type:
-                    return task_type, fmt, content, output_format
-            except Exception:
-                pass
-
-    # Fall back to text part
-    text = context.get_user_input().strip()
-    if text:
-        # Try parsing text as JSON
-        try:
-            payload = json.loads(text)
-            task_type = payload.get("type") or payload.get("task_type")
-            inp = payload.get("input", {})
-            fmt = inp.get("format", "text")
-            content = inp.get("content", payload.get("content", ""))
-            output_format = payload.get("output", {}).get("format") if "output" in payload else None
-            if task_type:
-                return task_type, fmt, content, output_format
-        except json.JSONDecodeError:
-            pass
-        # Detect bare coordinates in text → reverse_geocode
-        # Matches patterns like "35.6762, 139.6503" or "35.6762 139.6503"
-        coord_match = re.search(
-            r'(-?\d{1,3}\.\d+)[,\s]+(-?\d{1,3}\.\d+)', text
-        )
-        if coord_match:
-            lat, lng = float(coord_match.group(1)), float(coord_match.group(2))
-            if -90 <= lat <= 90 and -180 <= lng <= 180:
-                return "reverse_geocode", "application/json", {"lat": lat, "lng": lng}, None
-        # Plain text — use as geocode content
-        return "geocode", "text", text, None
-
-    raise ValueError("Could not parse task type and input from message")
-
-
-# ---------------------------------------------------------------------------
-# A2A Agent Executor
-# ---------------------------------------------------------------------------
-
-SUPPORTED_TASK_TYPES = frozenset({
-    "geocode", "reverse_geocode", "directions",
-    "places_search", "place_details", "distance_matrix",
-})
-
-
-class GoogleMapsAgentExecutor(AgentExecutor):
-    """Executes Google Maps tasks using the A2A v1 immediate Message response pattern.
-
-    Google Maps calls are synchronous and complete in a single round-trip, so we use
-    the A2A immediate response workflow: enqueue a single Message rather than going
-    through the Task lifecycle (submit → working → completed). This avoids the
-    requirement to enqueue a Task proto before sending TaskStatusUpdateEvent.
-    """
-
-    async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
-        from a2a.types.a2a_pb2 import Message as A2AMessage
-
-        try:
-            task_type, fmt, content, output_format = _parse_message_input(context)
-
-            if task_type not in SUPPORTED_TASK_TYPES:
-                raise ValueError(
-                    f"Unsupported task type: '{task_type}'. "
-                    f"Must be one of: {sorted(SUPPORTED_TASK_TYPES)}"
-                )
-
-            logger.info("Executing Google Maps task type=%s", task_type)
-            result = await maps_service.execute(task_type, fmt, content, output_format)
-            logger.info("Google Maps task completed type=%s", task_type)
-
-            response = A2AMessage(
-                message_id=str(uuid.uuid4()),
-                role=ROLE_AGENT,
-                task_id=context.task_id or "",
-                context_id=context.context_id or "",
-                parts=[_make_data_part(result)],
-            )
-
-        except Exception as e:
-            logger.error("Google Maps task failed: %s", e, exc_info=True)
-            response = A2AMessage(
-                message_id=str(uuid.uuid4()),
-                role=ROLE_AGENT,
-                task_id=context.task_id or "",
-                context_id=context.context_id or "",
-                parts=[Part(text=f"Error: {e.detail if isinstance(e, Exception) and hasattr(e, 'detail') else str(e)}")],
-            )
-
-        await event_queue.enqueue_event(response)
-
-    async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
-        logger.info("Cancel requested task_id=%s", context.task_id)
-        # Immediate-response agents have nothing to cancel; acknowledge gracefully.
-        from a2a.types.a2a_pb2 import Message as A2AMessage
-        response = A2AMessage(
-            message_id=str(uuid.uuid4()),
-            role=ROLE_AGENT,
-            task_id=context.task_id or "",
-            context_id=context.context_id or "",
-            parts=[Part(text="Task cancelled.")],
-        )
-        await event_queue.enqueue_event(response)
-
-
-# ---------------------------------------------------------------------------
 # Authentication and IP middleware
 # ---------------------------------------------------------------------------
 
@@ -548,11 +423,9 @@ class SecurityMiddleware(BaseHTTPMiddleware):
 # Request handler and routes
 # ---------------------------------------------------------------------------
 
-task_store = InMemoryTaskStore()
-
 request_handler = DefaultRequestHandler(
-    agent_executor=GoogleMapsAgentExecutor(),
-    task_store=task_store,
+    agent_executor=GoogleMapsAgentExecutor(maps_agent),
+    task_store=InMemoryTaskStore(),
     agent_card=AGENT_CARD,
 )
 

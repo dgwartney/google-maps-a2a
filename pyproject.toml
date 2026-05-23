@@ -8,6 +8,8 @@ dependencies = [
     "httpx>=0.28.1",
     "pydantic>=2.11.3",
     "pydantic-settings>=2.3.0",
+    "google-adk>=1.7.0,<2.0.0",
+    "google-genai>=1.9.0",
 ]
 
 [dependency-groups]
@@ -21,3 +23,4 @@ dev = [
 asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["."]
+addopts = "--cov=main --cov=agent --cov=agent_executor"

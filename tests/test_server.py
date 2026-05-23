@@ -16,15 +16,16 @@ from starlette.testclient import TestClient
 # Set environment variables BEFORE importing main
 os.environ["API_KEY"] = "test_api_key"
 os.environ["GOOGLE_MAPS_API_KEY"] = "test_google_maps_api_key"
+os.environ["GOOGLE_API_KEY"] = "test_google_api_key"
 os.environ["LOG_LEVEL"] = "DEBUG"
 
+from agent import GoogleMapsAgent  # noqa: E402
+from agent_executor import GoogleMapsAgentExecutor  # noqa: E402
 from main import (  # noqa: E402
     Config,
-    GoogleMapsAgentExecutor,
     GoogleMapsService,
     AGENT_CARD,
     AGENT_CARD_DICT,
-    SUPPORTED_TASK_TYPES,
     app,
     config,
     maps_service,
@@ -90,8 +91,36 @@ def make_mock_response(status: str = "OK", extra: dict | None = None) -> MagicMo
     return mock
 
 
+def assert_task_completed(result: dict) -> str:
+    """Assert JSON-RPC success with a completed task+artifact; return the text from the artifact."""
+    assert "error" not in result, f"Unexpected error: {result.get('error')}"
+    assert "result" in result
+    r = result["result"]
+    # ADK executor returns task+artifacts pattern
+    assert "task" in r, f"Expected 'task' in result, got: {list(r.keys())}"
+    task = r["task"]
+    assert task["status"]["state"] == "TASK_STATE_COMPLETED", (
+        f"Expected COMPLETED, got {task['status']['state']}"
+    )
+    artifacts = task.get("artifacts", [])
+    assert artifacts, "Task has no artifacts"
+    parts = artifacts[0].get("parts", [])
+    assert parts, "Artifact has no parts"
+    assert "text" in parts[0], f"Expected text part, got: {list(parts[0].keys())}"
+    return parts[0]["text"]
+
+
+def assert_task_failed(result: dict) -> None:
+    """Assert JSON-RPC success with a failed task."""
+    assert "error" not in result, f"Unexpected error: {result.get('error')}"
+    r = result.get("result", {})
+    task = r.get("task", {})
+    assert task.get("status", {}).get("state") == "TASK_STATE_FAILED"
+
+
+# Legacy helper kept for infrastructure tests that don't go through ADK
 def assert_message_response(result: dict, check_data: bool = True) -> dict:
-    """Assert JSON-RPC success with a message response; return the data dict from the first part."""
+    """Assert JSON-RPC success with a message response (non-ADK path)."""
     assert "error" not in result, f"Unexpected error: {result.get('error')}"
     assert "result" in result
     r = result["result"]
@@ -108,8 +137,45 @@ def assert_message_response(result: dict, check_data: bool = True) -> dict:
 # Mock fixture
 # ---------------------------------------------------------------------------
 
+class FakeADKEvent:
+    """Minimal fake ADK event for testing the executor."""
+    def __init__(self, text: str = "ADK test response") -> None:
+        self._text = text
+        self.content = MagicMock()
+        self.content.parts = [MagicMock(text=text)]
+
+    def is_final_response(self) -> bool:
+        return True
+
+
+async def _fake_run_async(*args, **kwargs):
+    yield FakeADKEvent("ADK test response")
+
+
 @pytest.fixture
-def mock_maps_ok():
+def mock_adk():
+    """Mock the ADK Runner to avoid real Gemini calls.
+
+    Also patches session_service so no real session is created.
+    """
+    from agent_executor import GoogleMapsAgentExecutor
+    from main import request_handler
+
+    executor = request_handler.agent_executor
+
+    fake_session = MagicMock()
+    fake_session.id = "test-session-id"
+
+    with (
+        patch.object(executor._runner, "run_async", side_effect=_fake_run_async),
+        patch.object(executor._runner.session_service, "get_session", new=AsyncMock(return_value=None)),
+        patch.object(executor._runner.session_service, "create_session", new=AsyncMock(return_value=fake_session)),
+    ):
+        yield executor
+
+
+@pytest.fixture
+def mock_maps_ok(mock_adk):
     mock_client = AsyncMock()
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
@@ -119,7 +185,7 @@ def mock_maps_ok():
 
 
 @pytest.fixture
-def mock_maps_error():
+def mock_maps_error(mock_adk):
     mock_client = AsyncMock()
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
@@ -145,7 +211,10 @@ def test_well_known_agent_card():
     assert card["name"] == "Google Maps A2A"
     assert card["version"] == "2.0.0"
     skill_ids = {s["id"] for s in card["skills"]}
-    assert skill_ids == SUPPORTED_TASK_TYPES
+    assert skill_ids == {
+        "geocode", "reverse_geocode", "directions",
+        "places_search", "place_details", "distance_matrix",
+    }
     assert card["capabilities"]["streaming"] is False
     assert len(card["supportedInterfaces"]) == 1
     assert card["supportedInterfaces"][0]["protocolBinding"] == "jsonrpc"
@@ -208,256 +277,80 @@ def test_well_known_requires_no_auth():
 
 
 # ---------------------------------------------------------------------------
-# 4. Geocode
+# 4–9. Skill execution via ADK executor
+#
+# With mock_adk, run_async returns "ADK test response" for all inputs.
+# The executor produces TASK_STATE_COMPLETED with a text artifact.
+# Specific skill output validation is covered by tests/test_deployment.py.
 # ---------------------------------------------------------------------------
 
 def test_geocode_text_input(mock_maps_ok):
     r = client.post("/", json=send_message_payload("geocode", "text", "Mountain View, CA"), headers=headers())
-    data = assert_message_response(r.json())
-    assert data["status"] == "OK"
-    assert data["results"][0]["formatted_address"]
+    text = assert_task_completed(r.json())
+    assert len(text) > 0
 
 
 def test_geocode_json_input(mock_maps_ok):
     r = client.post("/", json=send_message_payload("geocode", "application/json", {"address": "Mountain View"}), headers=headers())
-    data = assert_message_response(r.json())
-    assert data["status"] == "OK"
+    assert_task_completed(r.json())
 
-
-def test_geocode_geojson_output(mock_maps_ok):
-    payload = jsonrpc("SendMessage", {"message": {
-        "messageId": "m", "role": "ROLE_USER",
-        "parts": [{"data": {
-            "type": "geocode",
-            "input": {"format": "text", "content": "Mountain View"},
-            "output": {"format": "application/geo+json"},
-        }, "mediaType": "application/json"}],
-    }})
-    r = client.post("/", json=payload, headers=headers())
-    data = assert_message_response(r.json())
-    assert data["type"] == "Feature"
-    assert data["geometry"]["type"] == "Point"
-
-
-def test_geocode_api_failure_returns_error_message(mock_maps_error):
-    r = client.post("/", json=send_message_payload("geocode", "text", "Nowhere"), headers=headers())
-    result = r.json()
-    # On failure, executor sends a text error Message (not a data part)
-    assert "result" in result
-    part = result["result"]["message"]["parts"][0]
-    assert "text" in part
-    assert "Error" in part["text"]
-
-
-# ---------------------------------------------------------------------------
-# 5. Reverse geocode
-# ---------------------------------------------------------------------------
 
 def test_reverse_geocode(mock_maps_ok):
     r = client.post("/", json=send_message_payload("reverse_geocode", "application/json", {"lat": 37.42, "lng": -122.08}), headers=headers())
-    data = assert_message_response(r.json())
-    assert data["status"] == "OK"
+    assert_task_completed(r.json())
 
-
-def test_reverse_geocode_text_output(mock_maps_ok):
-    payload = jsonrpc("SendMessage", {"message": {
-        "messageId": "m", "role": "ROLE_USER",
-        "parts": [{"data": {
-            "type": "reverse_geocode",
-            "input": {"format": "application/json", "content": {"lat": 37.42, "lng": -122.08}},
-            "output": {"format": "text"},
-        }, "mediaType": "application/json"}],
-    }})
-    r = client.post("/", json=payload, headers=headers())
-    data = assert_message_response(r.json())
-    assert "address" in data
-
-
-def test_reverse_geocode_missing_lat_lng(mock_maps_ok):
-    r = client.post("/", json=send_message_payload("reverse_geocode", "application/json", {"foo": "bar"}), headers=headers())
-    part = r.json()["result"]["message"]["parts"][0]
-    assert "text" in part and "Error" in part["text"]
-
-
-def test_reverse_geocode_non_json_input(mock_maps_ok):
-    r = client.post("/", json=send_message_payload("reverse_geocode", "text", "37.42,-122.08"), headers=headers())
-    part = r.json()["result"]["message"]["parts"][0]
-    assert "text" in part and "Error" in part["text"]
-
-
-def test_reverse_geocode_api_failure(mock_maps_error):
-    r = client.post("/", json=send_message_payload("reverse_geocode", "application/json", {"lat": 0, "lng": 0}), headers=headers())
-    part = r.json()["result"]["message"]["parts"][0]
-    assert "text" in part
-
-
-# ---------------------------------------------------------------------------
-# 6. Directions
-# ---------------------------------------------------------------------------
 
 def test_directions_json(mock_maps_ok):
     r = client.post("/", json=send_message_payload("directions", "application/json",
         {"origin": "San Francisco", "destination": "Mountain View", "mode": "driving"}), headers=headers())
-    data = assert_message_response(r.json())
-    assert data["status"] == "OK"
+    assert_task_completed(r.json())
 
-
-def test_directions_text_output(mock_maps_ok):
-    payload = jsonrpc("SendMessage", {"message": {
-        "messageId": "m", "role": "ROLE_USER",
-        "parts": [{"data": {
-            "type": "directions",
-            "input": {"format": "application/json", "content": {"origin": "SF", "destination": "LA", "mode": "driving"}},
-            "output": {"format": "text"},
-        }, "mediaType": "application/json"}],
-    }})
-    r = client.post("/", json=payload, headers=headers())
-    data = assert_message_response(r.json())
-    assert "directions" in data
-
-
-def test_directions_missing_origin(mock_maps_ok):
-    r = client.post("/", json=send_message_payload("directions", "application/json", {"destination": "LA"}), headers=headers())
-    part = r.json()["result"]["message"]["parts"][0]
-    assert "text" in part and "Error" in part["text"]
-
-
-def test_directions_missing_destination(mock_maps_ok):
-    r = client.post("/", json=send_message_payload("directions", "application/json", {"origin": "SF"}), headers=headers())
-    part = r.json()["result"]["message"]["parts"][0]
-    assert "text" in part and "Error" in part["text"]
-
-
-def test_directions_non_json_input(mock_maps_ok):
-    r = client.post("/", json=send_message_payload("directions", "text", "SF to LA"), headers=headers())
-    part = r.json()["result"]["message"]["parts"][0]
-    assert "text" in part and "Error" in part["text"]
-
-
-def test_directions_api_failure(mock_maps_error):
-    r = client.post("/", json=send_message_payload("directions", "application/json",
-        {"origin": "Nowhere", "destination": "Somewhere", "mode": "driving"}), headers=headers())
-    part = r.json()["result"]["message"]["parts"][0]
-    assert "text" in part
-
-
-# ---------------------------------------------------------------------------
-# 7. Places search
-# ---------------------------------------------------------------------------
 
 def test_places_search_text(mock_maps_ok):
     r = client.post("/", json=send_message_payload("places_search", "text", "coffee near Union Square"), headers=headers())
-    data = assert_message_response(r.json())
-    assert data["status"] == "OK"
+    assert_task_completed(r.json())
 
 
 def test_places_search_json_with_location(mock_maps_ok):
     r = client.post("/", json=send_message_payload("places_search", "application/json",
         {"query": "pizza", "location": {"lat": 37.77, "lng": -122.41}, "radius": 1000}), headers=headers())
-    data = assert_message_response(r.json())
-    assert data["status"] == "OK"
+    assert_task_completed(r.json())
 
-
-def test_places_search_geojson_output(mock_maps_ok):
-    mock_maps_ok.get.return_value = make_mock_response("OK", {
-        "results": [{"name": "Cafe", "formatted_address": "1 Main St",
-                     "geometry": {"location": {"lat": 37.42, "lng": -122.08}},
-                     "rating": 4.5, "place_id": "abc123"}]
-    })
-    payload = jsonrpc("SendMessage", {"message": {
-        "messageId": "m", "role": "ROLE_USER",
-        "parts": [{"data": {
-            "type": "places_search",
-            "input": {"format": "text", "content": "restaurants"},
-            "output": {"format": "application/geo+json"},
-        }, "mediaType": "application/json"}],
-    }})
-    r = client.post("/", json=payload, headers=headers())
-    data = assert_message_response(r.json())
-    assert data["type"] == "FeatureCollection"
-
-
-def test_places_search_api_failure(mock_maps_error):
-    r = client.post("/", json=send_message_payload("places_search", "text", "nowhere"), headers=headers())
-    part = r.json()["result"]["message"]["parts"][0]
-    assert "text" in part
-
-
-# ---------------------------------------------------------------------------
-# 8. Place details
-# ---------------------------------------------------------------------------
 
 def test_place_details(mock_maps_ok):
     r = client.post("/", json=send_message_payload("place_details", "application/json", {"place_id": "abc"}), headers=headers())
-    data = assert_message_response(r.json())
-    assert data["status"] == "OK"
+    assert_task_completed(r.json())
 
-
-def test_place_details_missing_place_id(mock_maps_ok):
-    r = client.post("/", json=send_message_payload("place_details", "application/json", {"foo": "bar"}), headers=headers())
-    part = r.json()["result"]["message"]["parts"][0]
-    assert "text" in part and "Error" in part["text"]
-
-
-def test_place_details_non_json_input(mock_maps_ok):
-    r = client.post("/", json=send_message_payload("place_details", "text", "somewhere"), headers=headers())
-    part = r.json()["result"]["message"]["parts"][0]
-    assert "text" in part and "Error" in part["text"]
-
-
-def test_place_details_api_failure(mock_maps_error):
-    r = client.post("/", json=send_message_payload("place_details", "application/json", {"place_id": "invalid"}), headers=headers())
-    part = r.json()["result"]["message"]["parts"][0]
-    assert "text" in part
-
-
-# ---------------------------------------------------------------------------
-# 9. Distance matrix
-# ---------------------------------------------------------------------------
 
 def test_distance_matrix(mock_maps_ok):
     r = client.post("/", json=send_message_payload("distance_matrix", "application/json",
         {"origins": ["SF"], "destinations": ["Mountain View"], "mode": "driving"}), headers=headers())
-    data = assert_message_response(r.json())
-    assert data["status"] == "OK"
+    assert_task_completed(r.json())
 
 
-def test_distance_matrix_missing_origins(mock_maps_ok):
-    r = client.post("/", json=send_message_payload("distance_matrix", "application/json", {"destinations": ["LA"]}), headers=headers())
-    part = r.json()["result"]["message"]["parts"][0]
-    assert "text" in part and "Error" in part["text"]
+def test_adk_executor_failure_returns_failed_task(mock_adk):
+    """When ADK run_async raises, executor marks task TASK_STATE_FAILED."""
+    from main import request_handler
+    executor = request_handler.agent_executor
 
+    async def _raise(*args, **kwargs):
+        raise RuntimeError("Simulated ADK failure")
+        yield  # make it an async generator
 
-def test_distance_matrix_missing_destinations(mock_maps_ok):
-    r = client.post("/", json=send_message_payload("distance_matrix", "application/json", {"origins": ["SF"]}), headers=headers())
-    part = r.json()["result"]["message"]["parts"][0]
-    assert "text" in part and "Error" in part["text"]
-
-
-def test_distance_matrix_non_json_input(mock_maps_ok):
-    r = client.post("/", json=send_message_payload("distance_matrix", "text", "SF to LA"), headers=headers())
-    part = r.json()["result"]["message"]["parts"][0]
-    assert "text" in part and "Error" in part["text"]
-
-
-def test_distance_matrix_api_failure(mock_maps_error):
-    r = client.post("/", json=send_message_payload("distance_matrix", "application/json",
-        {"origins": ["Nowhere"], "destinations": ["Somewhere"]}), headers=headers())
-    part = r.json()["result"]["message"]["parts"][0]
-    assert "text" in part
+    with patch.object(executor._runner, "run_async", side_effect=_raise):
+        r = client.post("/", json=send_message_payload("geocode", "text", "test"), headers=headers())
+    assert_task_failed(r.json())
 
 
 # ---------------------------------------------------------------------------
 # 10. Input parsing
 # ---------------------------------------------------------------------------
 
-def test_unsupported_task_type_returns_error(mock_maps_ok):
+def test_unsupported_task_type_is_sent_to_adk(mock_adk):
+    """Unsupported type strings are passed as-is to ADK; ADK handles routing."""
     r = client.post("/", json=send_message_payload("fly_me_to_the_moon", "text", "test"), headers=headers())
-    result = r.json()
-    # Should return error message (not JSON-RPC error, but agent error in message)
-    assert "result" in result
-    part = result["result"]["message"]["parts"][0]
-    assert "text" in part and "Error" in part["text"]
+    # ADK mock returns "ADK test response" — task completes (Gemini would handle unknown intent)
+    assert_task_completed(r.json())
 
 
 def test_text_part_parsed_as_geocode(mock_maps_ok):
@@ -466,8 +359,7 @@ def test_text_part_parsed_as_geocode(mock_maps_ok):
         "parts": [{"text": '{"type":"geocode","input":{"format":"text","content":"Times Square"}}'}],
     }})
     r = client.post("/", json=payload, headers=headers())
-    data = assert_message_response(r.json())
-    assert data["status"] == "OK"
+    assert_task_completed(r.json())
 
 
 # ---------------------------------------------------------------------------
@@ -508,29 +400,27 @@ async def test_google_maps_service_unknown_type():
 # 13. Coverage gap tests
 # ---------------------------------------------------------------------------
 
-def test_plain_text_input_treated_as_geocode(mock_maps_ok):
-    """Plain-text parts (not JSON) fall back to geocode."""
+def test_plain_text_input_treated_as_geocode(mock_adk):
+    """Plain-text messages are routed to ADK which processes them naturally."""
     payload = jsonrpc("SendMessage", {"message": {
         "messageId": "m", "role": "ROLE_USER",
         "parts": [{"text": "1600 Amphitheatre Parkway Mountain View CA"}],
     }})
     r = client.post("/", json=payload, headers=headers())
-    data = assert_message_response(r.json())
-    assert data["status"] == "OK"
+    assert_task_completed(r.json())
 
 
-def test_data_part_without_task_type_falls_back_to_text(mock_maps_ok):
-    """Data part with no 'type' field falls back to text parsing, then geocode."""
+def test_data_part_without_task_type_falls_back_to_text(mock_adk):
+    """Any input — structured or plain text — is routed through ADK."""
     payload = jsonrpc("SendMessage", {"message": {
         "messageId": "m", "role": "ROLE_USER",
         "parts": [
             {"data": {"no_type_here": True}, "mediaType": "application/json"},
-            {"text": '{"type":"geocode","input":{"format":"text","content":"Times Square"}}'},
+            {"text": "geocode Times Square"},
         ],
     }})
     r = client.post("/", json=payload, headers=headers())
-    data = assert_message_response(r.json())
-    assert data["status"] == "OK"
+    assert_task_completed(r.json())
 
 
 def test_cancel_task(mock_maps_ok):
@@ -564,3 +454,169 @@ def test_ip_allowlist_blocks_request():
     assert r.status_code == 403
 
     m.config.__dict__["allowed_ips"] = original
+
+
+# ---------------------------------------------------------------------------
+# 14. GoogleMapsService direct unit tests (cover handler methods in main.py)
+# ---------------------------------------------------------------------------
+
+async def test_service_geocode_text(mock_maps_ok):
+    result = await maps_service.execute("geocode", "text", "Mountain View, CA")
+    assert result["status"] == "OK"
+
+
+async def test_service_geocode_json(mock_maps_ok):
+    result = await maps_service.execute("geocode", "application/json", {"address": "Mountain View"})
+    assert result["status"] == "OK"
+
+
+async def test_service_geocode_geojson(mock_maps_ok):
+    result = await maps_service.execute("geocode", "text", "Mountain View", output_format="application/geo+json")
+    assert result["type"] == "Feature"
+    assert result["geometry"]["type"] == "Point"
+
+
+async def test_service_reverse_geocode_json(mock_maps_ok):
+    result = await maps_service.execute("reverse_geocode", "application/json", {"lat": 37.42, "lng": -122.08})
+    assert result["status"] == "OK"
+
+
+async def test_service_reverse_geocode_text(mock_maps_ok):
+    result = await maps_service.execute("reverse_geocode", "application/json", {"lat": 37.42, "lng": -122.08}, output_format="text")
+    assert "address" in result
+
+
+async def test_service_reverse_geocode_missing_lat(mock_maps_ok):
+    from fastapi import HTTPException
+    with pytest.raises(Exception):
+        await maps_service.execute("reverse_geocode", "application/json", {"foo": "bar"})
+
+
+async def test_service_reverse_geocode_non_json(mock_maps_ok):
+    from fastapi import HTTPException
+    with pytest.raises(Exception):
+        await maps_service.execute("reverse_geocode", "text", "37.42,-122.08")
+
+
+async def test_service_directions_json(mock_maps_ok):
+    result = await maps_service.execute("directions", "application/json",
+                                        {"origin": "SF", "destination": "LA", "mode": "driving"})
+    assert result["status"] == "OK"
+
+
+async def test_service_directions_text(mock_maps_ok):
+    result = await maps_service.execute(
+        "directions", "application/json",
+        {"origin": "SF", "destination": "LA", "mode": "driving"},
+        None,  # output_format as positional
+    )
+    assert result["status"] == "OK"
+
+
+async def test_service_directions_missing_origin(mock_maps_ok):
+    with pytest.raises(Exception):
+        await maps_service.execute("directions", "application/json", {"destination": "LA"})
+
+
+async def test_service_directions_missing_destination(mock_maps_ok):
+    with pytest.raises(Exception):
+        await maps_service.execute("directions", "application/json", {"origin": "SF"})
+
+
+async def test_service_directions_non_json(mock_maps_ok):
+    with pytest.raises(Exception):
+        await maps_service.execute("directions", "text", "SF to LA")
+
+
+async def test_service_places_search_text(mock_maps_ok):
+    result = await maps_service.execute("places_search", "text", "coffee")
+    assert result["status"] == "OK"
+
+
+async def test_service_places_search_with_location(mock_maps_ok):
+    result = await maps_service.execute("places_search", "application/json",
+                                        {"query": "pizza", "location": {"lat": 37.77, "lng": -122.41}, "radius": 1000})
+    assert result["status"] == "OK"
+
+
+async def test_service_places_search_geojson(mock_maps_ok):
+    result = await maps_service.execute("places_search", "text", "parks", output_format="application/geo+json")
+    assert result["type"] == "FeatureCollection"
+
+
+async def test_service_place_details(mock_maps_ok):
+    result = await maps_service.execute("place_details", "application/json", {"place_id": "abc"})
+    assert result["status"] == "OK"
+
+
+async def test_service_place_details_missing_id(mock_maps_ok):
+    with pytest.raises(Exception):
+        await maps_service.execute("place_details", "application/json", {"foo": "bar"})
+
+
+async def test_service_place_details_non_json(mock_maps_ok):
+    with pytest.raises(Exception):
+        await maps_service.execute("place_details", "text", "some place")
+
+
+async def test_service_distance_matrix(mock_maps_ok):
+    result = await maps_service.execute("distance_matrix", "application/json",
+                                        {"origins": ["SF"], "destinations": ["LA"], "mode": "driving"})
+    assert result["status"] == "OK"
+
+
+async def test_service_distance_matrix_missing_origins(mock_maps_ok):
+    with pytest.raises(Exception):
+        await maps_service.execute("distance_matrix", "application/json", {"destinations": ["LA"]})
+
+
+async def test_service_distance_matrix_missing_destinations(mock_maps_ok):
+    with pytest.raises(Exception):
+        await maps_service.execute("distance_matrix", "application/json", {"origins": ["SF"]})
+
+
+async def test_service_distance_matrix_non_json(mock_maps_ok):
+    with pytest.raises(Exception):
+        await maps_service.execute("distance_matrix", "text", "SF to LA")
+
+
+async def test_service_api_error(mock_maps_error):
+    from fastapi import HTTPException
+    with pytest.raises(Exception):
+        await maps_service.execute("geocode", "text", "Nowhere")
+
+
+async def test_service_unknown_type():
+    with pytest.raises(ValueError, match="Unknown task type"):
+        await maps_service.execute("nonexistent", "text", "test")
+
+
+# ---------------------------------------------------------------------------
+# 15. GoogleMapsAgent unit tests (cover agent.py)
+# ---------------------------------------------------------------------------
+
+def test_agent_builds_successfully():
+    from main import maps_service as svc
+    agent = GoogleMapsAgent(svc)
+    assert agent.agent is not None
+    assert agent.agent.name == "google_maps_agent"
+    assert len(agent.agent.tools) == 6
+
+
+# ---------------------------------------------------------------------------
+# 16. GoogleMapsAgentExecutor unit tests (cover agent_executor.py)
+# ---------------------------------------------------------------------------
+
+def test_executor_initialises_runner(mock_adk):
+    from main import request_handler
+    executor = request_handler.agent_executor
+    assert executor._runner is not None
+
+
+async def test_executor_cancel_raises(mock_adk):
+    from main import request_handler
+    from unittest.mock import MagicMock
+    mock_ctx = MagicMock()
+    mock_ctx.task_id = "test"
+    with pytest.raises(NotImplementedError):
+        await request_handler.agent_executor.cancel(mock_ctx, None)
