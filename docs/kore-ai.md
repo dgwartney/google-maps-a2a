@@ -58,16 +58,15 @@ No authentication is required. The card describes 6 skills (geocode, reverse_geo
 | **Agent Card URL** | `https://google-maps-a2a.fly.dev/.well-known/agent-card.json` |
 | **Endpoint** | `https://google-maps-a2a.fly.dev/` |
 | **Auth header name** | `X-API-Key` |
-| **Auth header value** | `<your API_KEY secret>` |
-| **Protocol version header** | `A2A-Version: 1.0` |
+| **Auth header value** | `<your A2A_API_KEY secret>` |
 
-Store the `API_KEY` value in Kore AI's credential store and reference it in the agent definition. Do not hardcode it in the configuration.
+Store the `A2A_API_KEY` value in Kore AI's credential store and reference it in the agent definition. Do not hardcode it in the configuration.
 
 ---
 
 ## JSON-RPC Request Format
 
-All skill calls use `POST /` with the `SendMessage` method. The skill input is encoded as a `data` part in the message:
+All skill calls use `POST /` with the `SendMessage` method. Send a plain-text natural language query — Gemini 2.0 Flash selects the right Maps tool automatically:
 
 ```json
 {
@@ -79,153 +78,99 @@ All skill calls use `POST /` with the `SendMessage` method. The skill input is e
       "messageId": "<uuid>",
       "role": "ROLE_USER",
       "parts": [
-        {
-          "data": {
-            "type": "<skill-id>",
-            "input": {
-              "format": "<input-format>",
-              "content": <string or object>
-            }
-          },
-          "mediaType": "application/json"
-        }
+        {"text": "<natural language query>"}
       ]
     }
   }
 }
 ```
 
+You do not need to specify a skill ID or input format. Gemini interprets the query, calls the appropriate Maps API tool, and returns a conversational plain-text answer.
+
 ---
 
-## Skill Examples (all 6)
+## Skill Query Examples (all 6)
 
 ### geocode
 
-```json
-{
-  "type": "geocode",
-  "input": {"format": "text", "content": "{{user_address}}"}
-}
+```
+"What are the GPS coordinates for {{user_address}}?"
+"Find the latitude and longitude of {{landmark}}"
 ```
 
 ### reverse_geocode
 
-```json
-{
-  "type": "reverse_geocode",
-  "input": {"format": "application/json", "content": {"lat": {{latitude}}, "lng": {{longitude}}}}
-}
+```
+"What address is at latitude {{latitude}} longitude {{longitude}}?"
+"What is the place at GPS coordinates {{lat}}, {{lng}}?"
 ```
 
 ### directions
 
-```json
-{
-  "type": "directions",
-  "input": {
-    "format": "application/json",
-    "content": {
-      "origin": "{{origin}}",
-      "destination": "{{destination}}",
-      "mode": "driving"
-    }
-  }
-}
+```
+"How do I drive from {{origin}} to {{destination}}?"
+"Give me walking directions from {{origin}} to {{destination}}"
 ```
 
-Supported `mode` values: `driving`, `walking`, `transit`, `bicycling`
+Supported modes: driving, walking, transit, bicycling — just mention them in the query.
 
 ### places_search
 
-```json
-{"type": "places_search", "input": {"format": "text", "content": "{{search_query}}"}}
 ```
-
-With location context:
-
-```json
-{
-  "type": "places_search",
-  "input": {
-    "format": "application/json",
-    "content": {"query": "{{search_query}}", "location": {"lat": {{lat}}, "lng": {{lng}}}, "radius": 1000}
-  }
-}
+"Find {{type}} near {{location}}"
+"What {{type}} are close to {{address}}?"
 ```
 
 ### place_details
 
-```json
-{
-  "type": "place_details",
-  "input": {"format": "application/json", "content": {"place_id": "{{place_id}}"}}
-}
+```
+"What are the opening hours and phone number for {{place_name}}?"
+"Tell me about {{place_name}} — address, hours, and rating"
 ```
 
 ### distance_matrix
 
-```json
-{
-  "type": "distance_matrix",
-  "input": {
-    "format": "application/json",
-    "content": {
-      "origins": ["{{origin}}"],
-      "destinations": ["{{destination}}"],
-      "mode": "driving"
-    }
-  }
-}
+```
+"How far is {{origin}} from {{destination}} by car?"
+"Compare driving times from {{origin}} to {{destination1}}, {{destination2}}, and {{destination3}}"
 ```
 
 ---
 
 ## Response Structure
 
-The result is always in `result.message.parts[0]`:
-
-**Success** — `parts[0].data` contains the Google Maps API result:
+All responses — success and error — are in `result.message.parts[0].text`:
 
 ```json
 {
   "result": {
     "message": {
       "role": "ROLE_AGENT",
-      "parts": [{"data": { ...Google Maps result... }, "mediaType": "application/json"}]
+      "parts": [{"text": "<conversational answer from Gemini>"}]
     }
   }
 }
 ```
 
-**Error** — `parts[0].text` contains the error description:
+Example response for a geocode query:
 
 ```json
 {
   "result": {
     "message": {
-      "parts": [{"text": "Error: Geocoding failed: ZERO_RESULTS"}]
+      "parts": [{"text": "The GPS coordinates for Times Square, New York are approximately 40.7580° N, 73.9855° W (latitude: 40.7580, longitude: -73.9855)."}]
     }
   }
 }
 ```
 
-### Key result paths by skill
-
-| Skill | Result path |
-|-------|------------|
-| `geocode` | `result.message.parts[0].data.results[0].geometry.location` → `{lat, lng}` |
-| `geocode` | `result.message.parts[0].data.results[0].formatted_address` |
-| `reverse_geocode` | `result.message.parts[0].data.results[0].formatted_address` |
-| `directions` | `result.message.parts[0].data.routes[0].legs[0].distance.text` |
-| `places_search` | `result.message.parts[0].data.results[]` → array of places |
-| `place_details` | `result.message.parts[0].data.result` → full place object |
-| `distance_matrix` | `result.message.parts[0].data.rows[0].elements[0].distance.text` |
+When a request fails (e.g., an address is not found or a Google Maps API error occurs), the `text` part contains an error description from Gemini rather than structured data.
 
 ---
 
 ## IP Allowlisting
 
-For production, restrict this server to only accept calls from Kore AI's egress IPs. This prevents misuse even if the `API_KEY` is compromised.
+For production, restrict this server to only accept calls from Kore AI's egress IPs. This prevents misuse even if the `A2A_API_KEY` is compromised.
 
 **Find Kore AI's outbound IP ranges:**
 - Check https://docs.kore.ai (search "outbound IP" or "egress IP")
@@ -247,9 +192,8 @@ Before configuring Kore, verify the server responds correctly:
 
 ```bash
 curl -X POST https://google-maps-a2a.fly.dev/ \
-  -H "X-API-Key: <your-API_KEY>" \
+  -H "X-API-Key: <your-A2A_API_KEY>" \
   -H "Content-Type: application/json" \
-  -H "A2A-Version: 1.0" \
   -d '{
     "jsonrpc": "2.0",
     "id": "test-1",
@@ -258,16 +202,13 @@ curl -X POST https://google-maps-a2a.fly.dev/ \
       "message": {
         "messageId": "m1",
         "role": "ROLE_USER",
-        "parts": [{
-          "data": {"type": "geocode", "input": {"format": "text", "content": "Times Square, New York"}},
-          "mediaType": "application/json"
-        }]
+        "parts": [{"text": "What are the GPS coordinates for Times Square, New York?"}]
       }
     }
   }'
 ```
 
-Expected: `result.message.parts[0].data.results[0].geometry.location` contains `lat` and `lng` for Times Square.
+Expected: `result.message.parts[0].text` contains a conversational answer with the latitude and longitude for Times Square.
 
 ---
 
@@ -374,8 +315,8 @@ This demo walks through all 6 skills in a natural, connected flow.
 > "I've asked the agent to find the coordinates for our client's office. The agent is routing this to the **geocode** skill, calling the Google Maps Geocoding API, and returning structured data. Notice I just typed a natural sentence — I didn't specify a skill or an API."
 
 **What to highlight in the response:**
-- `results[0].geometry.location` — shows `lat: 37.42` and `lng: -122.08`
-- `results[0].formatted_address` — confirms the full validated address
+- The latitude/longitude values (e.g. `37.4224° N, 122.0856° W`)
+- The full validated address returned by Gemini's conversational answer
 
 **Key point for audience:**
 > "These coordinates can now be passed to any downstream agent or tool in your workflow — for example, to plot the location on a map or trigger a geo-fenced notification."
@@ -391,9 +332,8 @@ This demo walks through all 6 skills in a natural, connected flow.
 > "Now I need to know how to get there from the airport. The agent recognizes this as a navigation request and routes it to the **directions** skill. It's calling the Google Maps Directions API and returning the full route."
 
 **What to highlight in the response:**
-- `routes[0].legs[0].distance.text` — e.g. "22.3 mi"
-- `routes[0].legs[0].duration.text` — e.g. "28 mins"
-- First few steps in `steps[]` — human-readable turn-by-turn instructions
+- Distance (e.g. "22.3 miles") and duration (e.g. "28 minutes") in the text answer
+- Turn-by-turn steps summarised by Gemini in the conversational response
 
 **Key point for audience:**
 > "You can also ask for walking or transit directions. The agent supports driving, walking, bicycling, and transit modes — just say it in the request."
@@ -409,9 +349,9 @@ This demo walks through all 6 skills in a natural, connected flow.
 > "Our meeting runs through lunch, so let's find somewhere nearby to eat. This routes to the **places_search** skill. The agent is querying the Google Places API and returning a list of matching businesses with names, addresses, and ratings."
 
 **What to highlight in the response:**
-- `results[0].name` and `results[0].rating` — top result with rating
-- `results[0].formatted_address` — address of the place
-- Total number of results returned
+- Top result name and rating in the conversational answer
+- Addresses of nearby places
+- Number of results summarised by Gemini
 
 **Key point for audience:**
 > "You can also pass a location and radius in the request for more precise searches — for example, 'within 500 meters of our office'. The agent also supports GeoJSON output if you need to feed results into a mapping component."
@@ -430,11 +370,9 @@ This demo walks through all 6 skills in a natural, connected flow.
 > "Let's get more detail on that top result. I'm passing the place ID from the previous response to the **place_details** skill. This pulls the full record from Google Places — hours, phone, website, and more."
 
 **What to highlight in the response:**
-- `result.name` — confirmed restaurant name
-- `result.formatted_phone_number` — contact number
-- `result.opening_hours.weekday_text[]` — operating hours
-- `result.website` — booking or menu link
-- `result.rating` and `result.user_ratings_total`
+- Confirmed restaurant name and phone number in the text answer
+- Operating hours and website returned by Gemini
+- Rating and review count summarised in the response
 
 **Key point for audience:**
 > "This is a great example of chaining skills together. The place ID came from the search in Scene 3 and flowed directly into this detail lookup — exactly the kind of multi-step reasoning your orchestrating agent can do automatically."
@@ -450,9 +388,8 @@ This demo walks through all 6 skills in a natural, connected flow.
 > "I have three hotel options and I want to compare commute times to the client site. One request to the **distance_matrix** skill returns all three distances and durations simultaneously. This would take three separate Directions calls otherwise."
 
 **What to highlight in the response:**
-- `rows[0].elements[]` — one entry per destination
-- Each element's `distance.text` and `duration.text`
-- Side-by-side comparison of all three options
+- Distance and duration for each hotel in the text answer
+- Side-by-side comparison presented conversationally by Gemini
 
 **Key point for audience:**
 > "The distance matrix is perfect for logistics decisions — comparing multiple suppliers, delivery routes, or service territories. All in one API call."
@@ -468,8 +405,8 @@ This demo walks through all 6 skills in a natural, connected flow.
 > "Finally, a colleague dropped a pin on a map and sent me the raw coordinates. I need the actual address. The **reverse_geocode** skill converts those coordinates back into a human-readable address."
 
 **What to highlight in the response:**
-- `results[0].formatted_address` — the full street address
-- `results[0].address_components[]` — structured breakdown (street, city, state, zip)
+- The full street address returned in the conversational answer
+- Structured breakdown (street, city, state, zip) as described by Gemini
 
 **Key point for audience:**
 > "This is useful any time your workflow receives GPS coordinates from a mobile app, IoT device, or field team and needs to translate them into something actionable."
@@ -491,6 +428,7 @@ This demo walks through all 6 skills in a natural, connected flow.
 | Issue | Check |
 |-------|-------|
 | Agent shows **Disconnected** | Verify the agent card URL returns HTTP 200: `curl https://google-maps-a2a.fly.dev/.well-known/agent-card.json` |
-| Response contains an error message | The `A2A-Version: 1.0` header may be missing, or the API key may have expired — check fly.io secrets with `flyctl secrets list` |
-| Places search returns no results | Try a broader query; some location/radius combinations return zero results from Google's API |
-| Directions returns `ZERO_RESULTS` | Verify origin and destination are valid addresses or well-known place names |
+| Response contains an error message | Verify the `X-API-Key` header is correct — check fly.io secrets with `flyctl secrets list` |
+| Gemini returns no useful answer | The query may be ambiguous; try rephrasing with more location context |
+| Places search returns no results | Try a broader query; some location combinations return zero results from Google's API |
+| Directions response says route not found | Verify origin and destination are valid addresses or well-known place names |

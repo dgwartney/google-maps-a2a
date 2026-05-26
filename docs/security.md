@@ -21,13 +21,13 @@ python3 -c "import secrets; print(secrets.token_hex(32))"
 Set as a fly.io secret (never commit it to git):
 
 ```bash
-flyctl secrets set API_KEY=<your-strong-key>
+flyctl secrets set A2A_API_KEY=<your-strong-key>
 ```
 
 ### Rotating the key
 
 ```bash
-flyctl secrets set API_KEY=<new-key>
+flyctl secrets set A2A_API_KEY=<new-key>
 ```
 
 The running machine restarts automatically and begins accepting the new key immediately.
@@ -43,7 +43,7 @@ The running machine restarts automatically and begins accepting the new key imme
 
 ## IP Allowlist
 
-Restricts which source IP addresses can reach the server. This adds defense-in-depth: even if the `API_KEY` is leaked, requests from unlisted IPs are rejected before authentication is checked.
+Restricts which source IP addresses can reach the server. This adds defense-in-depth: even if the `A2A_API_KEY` is leaked, requests from unlisted IPs are rejected before authentication is checked.
 
 ### Configuration
 
@@ -104,7 +104,7 @@ app.add_middleware(
 
 ## Google Maps API Key Protection
 
-The `GOOGLE_MAPS_API_KEY` is used server-side only. It is:
+The `MAPS_A2A_MAPS_KEY` is used server-side only. It is:
 
 - Never returned in any API response
 - Never logged

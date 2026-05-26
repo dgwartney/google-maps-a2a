@@ -30,13 +30,14 @@ The `--no-deploy` flag lets you review `fly.toml` before the first deployment. T
 Secrets are encrypted at rest in fly.io's vault and injected as environment variables at runtime. They are never stored in `fly.toml` or git.
 
 ```bash
-flyctl secrets set API_KEY=<choose-a-strong-random-key>
-flyctl secrets set GOOGLE_MAPS_API_KEY=<your-google-maps-api-key>
+flyctl secrets set A2A_API_KEY=<choose-a-strong-random-key>
+flyctl secrets set MAPS_A2A_MAPS_KEY=<your-google-maps-api-key>
+flyctl secrets set MAPS_A2A_GEMINI_KEY=<your-gemini-api-key>
 ```
 
-Choose a strong value for `API_KEY` — a UUID or a 32+ character random string. This key must be sent by every caller in the `X-API-Key` header.
+Choose a strong value for `A2A_API_KEY` — a UUID or a 32+ character random string. This key must be sent by every caller in the `X-API-Key` header.
 
-See [google-maps-setup.md](google-maps-setup.md) to obtain a `GOOGLE_MAPS_API_KEY`.
+See [google-maps-setup.md](google-maps-setup.md) to obtain `MAPS_A2A_MAPS_KEY`. Get `MAPS_A2A_GEMINI_KEY` from [Google AI Studio](https://aistudio.google.com/app/apikey).
 
 ### 3. Deploy
 
@@ -56,19 +57,17 @@ curl https://google-maps-a2a.fly.dev/health
 # A2A v1 capability discovery — standard well-known URL (no auth required)
 curl https://google-maps-a2a.fly.dev/.well-known/agent-card.json
 
-# Test via JSON-RPC SendMessage (replace <API_KEY> with your chosen key)
+# Test via JSON-RPC SendMessage (replace <A2A_API_KEY> with your chosen key)
 curl -X POST https://google-maps-a2a.fly.dev/ \
-  -H "X-API-Key: <API_KEY>" \
+  -H "X-API-Key: <A2A_API_KEY>" \
   -H "Content-Type: application/json" \
-  -H "A2A-Version: 1.0" \
   -d '{
     "jsonrpc":"2.0","id":"1","method":"SendMessage",
-    "params":{"message":{"messageId":"m1","role":"ROLE_USER","parts":[{
-      "data":{"type":"geocode","input":{"format":"text","content":"Times Square, New York"}},
-      "mediaType":"application/json"
-    }]}}
+    "params":{"message":{"messageId":"m1","role":"ROLE_USER","parts":[
+      {"text":"What are the GPS coordinates for Times Square, New York?"}
+    ]}}
   }'
-# Expected: result.message.parts[0].data.results[0].geometry.location contains lat/lng
+# Expected: result.message.parts[0].text contains a conversational answer with lat/lng
 ```
 
 ---
@@ -80,7 +79,7 @@ curl -X POST https://google-maps-a2a.fly.dev/ \
 flyctl secrets list
 
 # Rotate a secret (machine restarts automatically)
-flyctl secrets set API_KEY=<new-value>
+flyctl secrets set A2A_API_KEY=<new-value>
 
 # Remove a secret
 flyctl secrets unset ALLOWED_IPS

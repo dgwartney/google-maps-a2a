@@ -11,6 +11,7 @@ from google.adk.artifacts import InMemoryArtifactService
 from google.adk.memory.in_memory_memory_service import InMemoryMemoryService
 from google.adk.sessions import InMemorySessionService
 from google.genai import types as genai_types
+from google.api_core.exceptions import ResourceExhausted
 from google.genai.errors import ClientError
 
 from agent import GoogleMapsAgent
@@ -77,8 +78,11 @@ class GoogleMapsAgentExecutor(AgentExecutor):
                             if hasattr(p, "text") and p.text
                         )
                 return response_text
-            except ClientError as exc:
-                if exc.status_code == 429:
+            except (ResourceExhausted, ClientError) as exc:
+                is_rate_limit = isinstance(exc, ResourceExhausted) or (
+                    isinstance(exc, ClientError) and exc.status_code == 429
+                )
+                if is_rate_limit:
                     last_exc = exc
                     continue
                 raise

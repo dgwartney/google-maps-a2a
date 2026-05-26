@@ -16,6 +16,48 @@ This server is built on the official [a2a-sdk](https://github.com/a2aproject/a2a
 
 ---
 
+## Architecture
+
+```
+Caller
+  │
+  ▼
+POST / (JSON-RPC 2.0)
+  │
+  ▼
+SecurityMiddleware          ← validates X-API-Key header
+  │
+  ▼
+DefaultRequestHandler       ← a2a-sdk JSON-RPC dispatch
+  │
+  ▼
+GoogleMapsAgentExecutor     ← AgentExecutor implementation
+  │  extracts plain-text query from message parts
+  ▼
+Google ADK Runner           ← google-adk
+  │  feeds query to Gemini 2.0 Flash with 6 tool definitions
+  ▼
+Gemini 2.0 Flash (LLM)      ← tool-calling
+  │  selects appropriate Maps tool, calls it
+  ▼
+GoogleMapsService           ← Maps Platform HTTP client
+  │  calls Google Maps APIs (Geocoding, Places, Directions, Distance Matrix)
+  ▼
+Plain-text response         ← Gemini synthesises conversational answer
+  │
+  ▼
+A2A Message (text part)     ← returned in SendMessage response
+  │
+  ▼
+Caller receives result.message.parts[0].text
+```
+
+### Key design choice: LLM-based routing
+
+All requests are processed as plain-text natural language queries. Gemini 2.0 Flash interprets the user's intent, decides which Maps tool to call (or chains multiple tools), executes it via Google ADK, and generates a conversational plain-text answer. This means callers do not need to know which skill to invoke — they just ask a question.
+
+---
+
 ## Agent Card
 
 The agent card is served at the A2A v1 standard well-known URL:
@@ -24,13 +66,15 @@ The agent card is served at the A2A v1 standard well-known URL:
 GET /.well-known/agent-card.json
 ```
 
-No authentication required. The card is generated from the protobuf `AgentCard` type and serialized to JSON:
+No authentication required. The card declares all 6 skills with `text/plain` input and output modes, reflecting the natural language interface:
 
 ```json
 {
   "name": "Google Maps A2A",
-  "description": "An A2A Protocol v1 compliant agent providing Google Maps Platform capabilities",
+  "description": "An A2A Protocol v1 compliant agent providing Google Maps Platform capabilities: geocoding, reverse geocoding, directions, places search, place details, and distance matrix.",
   "version": "2.0.0",
+  "url": "https://google-maps-a2a.fly.dev/",
+  "protocolVersion": "1.0",
   "supportedInterfaces": [
     {
       "url": "https://google-maps-a2a.fly.dev/",
@@ -42,8 +86,8 @@ No authentication required. The card is generated from the protobuf `AgentCard` 
     "streaming": false,
     "pushNotifications": false
   },
-  "defaultInputModes": ["application/json"],
-  "defaultOutputModes": ["application/json"],
+  "defaultInputModes": ["text/plain"],
+  "defaultOutputModes": ["text/plain"],
   "securitySchemes": {
     "apiKey": {
       "apiKeySecurityScheme": {
@@ -57,10 +101,14 @@ No authentication required. The card is generated from the protobuf `AgentCard` 
     {
       "id": "geocode",
       "name": "Geocode",
-      "description": "Convert an address to latitude/longitude coordinates",
+      "description": "Convert an address or place name to GPS coordinates.",
       "tags": ["maps", "geocoding", "coordinates"],
-      "inputModes": ["application/json", "text/plain"],
-      "outputModes": ["application/json", "application/geo+json"]
+      "inputModes": ["text/plain"],
+      "outputModes": ["text/plain"],
+      "examples": [
+        "What are the coordinates for the Eiffel Tower?",
+        "Convert 350 Fifth Avenue New York NY to GPS coordinates"
+      ]
     },
     ...
   ]
@@ -83,73 +131,70 @@ All agent operations use a single `POST /` endpoint with JSON-RPC 2.0 method dis
 
 ## Supported JSON-RPC Methods
 
-| Method | Description |
-|--------|-------------|
-| `SendMessage` | Send a message and receive an immediate response |
-| `GetTask` | Retrieve a task by ID |
-| `ListTasks` | List tasks |
-| `CancelTask` | Cancel a task |
+| Method | Also accepted as | Description |
+|--------|-----------------|-------------|
+| `SendMessage` | `message/send` (v0.3 compat) | Send a plain-text query, receive an immediate response |
+| `GetTask` | — | Retrieve a task by ID |
+| `ListTasks` | — | List tasks |
+| `CancelTask` | — | Cancel a task |
 
-All methods require the `A2A-Version: 1.0` header.
+The server runs with `enable_v0_3_compat=True`, so both the A2A v1.0 method name (`SendMessage`) and the v0.3/inspector form (`message/send`) are accepted.
 
 ---
 
 ## Message and Response Format
 
-### Input (skill invocation)
+### Input
 
-The `SendMessage` params contain a `Message` with `parts[]`. Each part has a `data` field (protobuf Value/Struct) containing the skill input:
+The `SendMessage` params contain a `Message` with a single plain-text part:
 
 ```json
 {
   "message": {
     "messageId": "<uuid>",
     "role": "ROLE_USER",
-    "parts": [{
-      "data": {
-        "type": "<skill-id>",
-        "input": {"format": "<fmt>", "content": <value>},
-        "output": {"format": "<fmt>"}
-      },
-      "mediaType": "application/json"
-    }]
+    "parts": [{"text": "What are the coordinates for Times Square?"}]
   }
 }
 ```
 
 ### Output (immediate Message response)
 
-Google Maps calls complete synchronously, so this server uses the A2A v1 **immediate Message response** pattern. The `SendMessageResponse` contains a `message` (not a `task`):
+Google ADK + Gemini processes the query synchronously. The `SendMessageResponse` contains a `message` (not a `task`) with a plain-text part:
 
 ```json
 {
   "result": {
     "message": {
       "role": "ROLE_AGENT",
-      "parts": [{"data": { ...Google Maps result... }, "mediaType": "application/json"}]
+      "parts": [{"text": "Times Square is located at approximately 40.7580° N, 73.9855° W (latitude: 40.7580, longitude: -73.9855)."}]
     }
   }
 }
 ```
 
-On error, the part contains `text` instead of `data`.
-
 ---
 
 ## Authentication
 
-The server uses API key authentication declared in `securitySchemes`. The `X-API-Key` header is validated by Starlette middleware before requests reach the A2A handler. Missing or invalid keys return HTTP 403/401 before any JSON-RPC processing occurs.
+The server uses API key authentication declared in `securitySchemes`. The `X-API-Key` header is validated by Starlette middleware before requests reach the A2A handler. Missing or invalid keys return HTTP 403/401 before any JSON-RPC processing occurs. Comparison is constant-time (`hmac.compare_digest`) to prevent timing attacks.
 
 ---
 
 ## Skills
 
-All 6 Google Maps capabilities are declared as A2A v1 `AgentSkill` objects with:
-- `id` — used in the `type` field of the input data
-- `name`, `description`, `tags`, `examples`
-- `inputModes`, `outputModes`
+All 6 Google Maps capabilities are declared as A2A v1 `AgentSkill` objects. Gemini selects among them at runtime based on the user's query — callers never specify a skill ID directly.
 
-See [usage.md](usage.md) for request/response examples for each skill.
+| Skill ID | Capability |
+|----------|-----------|
+| `geocode` | Address or place name → GPS coordinates |
+| `reverse_geocode` | GPS coordinates → human-readable address |
+| `directions` | Turn-by-turn routing between two locations |
+| `places_search` | Search for businesses and points of interest |
+| `place_details` | Hours, phone, rating, and website for a place |
+| `distance_matrix` | Travel distances/times between multiple origin-destination pairs |
+
+See [usage.md](usage.md) for example queries for each skill.
 
 ---
 
@@ -157,22 +202,38 @@ See [usage.md](usage.md) for request/response examples for each skill.
 
 ### Immediate response pattern
 
-All Google Maps API calls complete in a single round-trip (~100–500ms). The A2A v1 spec supports two patterns:
+All Google Maps API calls complete in a single round-trip. The A2A v1 spec supports two patterns:
 
 - **Immediate response**: Enqueue a `Message` object — returns synchronously in the `SendMessage` response
 - **Long-running task**: Enqueue a `Task` object, then send `TaskStatusUpdateEvent` / `TaskArtifactUpdateEvent`
 
-This server uses the **immediate response** pattern because all Google Maps calls complete synchronously. A2A clients receive a `message` in the `SendMessageResponse` rather than a `task`.
+This server uses the **immediate response** pattern. A2A clients receive a `message` in the `SendMessageResponse` rather than a `task`.
 
-### SDK
+### SDK and components
 
-Built on [a2a-sdk](https://pypi.org/project/a2a-sdk/) v1.0.3+. The `GoogleMapsAgentExecutor` implements `AgentExecutor.execute()` and `AgentExecutor.cancel()`. The `DefaultRequestHandler` and `create_jsonrpc_routes()` wire up the JSON-RPC dispatch layer.
+| Component | Library |
+|-----------|---------|
+| A2A transport | [a2a-sdk](https://pypi.org/project/a2a-sdk/) v1.0.3+ |
+| LLM agent | [google-adk](https://pypi.org/project/google-adk/) + Gemini 2.0 Flash |
+| Maps HTTP | httpx async client → Google Maps Platform REST APIs |
+| Task store | `InMemoryTaskStore` (single-machine; resets on restart) |
+| Sessions | `InMemorySessionService` (single-machine; keyed by A2A context ID) |
+
+`GoogleMapsAgentExecutor` implements `AgentExecutor.execute()` and `AgentExecutor.cancel()`. `DefaultRequestHandler` and `create_jsonrpc_routes()` wire up the JSON-RPC dispatch layer.
+
+### Rate limit handling
+
+The executor automatically retries on Gemini 429 `RESOURCE_EXHAUSTED` errors with exponential backoff: up to 3 retries at 5 s, 10 s, and 20 s intervals.
+
+### Session state
+
+ADK sessions are stored in memory using `InMemorySessionService`, keyed by the A2A `contextId`. Sessions persist across multiple `SendMessage` calls within the same context, allowing Gemini to maintain conversation history. **Sessions are lost on server restart** and are not shared across multiple server instances. For production multi-machine deployments, a database-backed session service would be required.
 
 ---
 
 ## Future Improvements
 
 1. Add streaming support (`SendStreamingMessage`) for progressive result delivery
-2. Implement persistent task storage (database-backed `TaskStore`) for multi-machine deployments
+2. Implement persistent task and session storage (database-backed) for multi-machine deployments
 3. Add push notification support for webhook-based result delivery
 4. Support `GetExtendedAgentCard` for authenticated capability discovery

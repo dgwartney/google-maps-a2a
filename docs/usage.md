@@ -5,7 +5,7 @@
 - [Environment Variables](#environment-variables)
 - [Endpoints](#endpoints)
 - [A2A Protocol v1 — Making Requests](#a2a-protocol-v1--making-requests)
-- [Task Types](#task-types)
+- [Skills](#skills)
 - [Error Handling](#error-handling)
 
 ---
@@ -14,10 +14,12 @@
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `API_KEY` | Yes | — | Key callers must send as `X-API-Key` header |
-| `GOOGLE_MAPS_API_KEY` | Yes | — | Google Cloud API key (server-side only) |
+| `A2A_API_KEY` | Yes | — | Key callers must send as `X-API-Key` header |
+| `MAPS_A2A_MAPS_KEY` | Yes | — | Google Cloud API key for Maps Platform calls |
+| `MAPS_A2A_GEMINI_KEY` | Yes | — | Gemini API key for natural language routing (ADK) |
 | `LOG_LEVEL` | No | `INFO` | Log verbosity: `DEBUG` \| `INFO` \| `WARNING` \| `ERROR` |
 | `ALLOWED_IPS` | No | (empty) | Comma-separated caller IPs to allow; empty = no restriction |
+| `BASE_URL` | No | `https://google-maps-a2a.fly.dev` | Public base URL used in the agent card |
 
 Copy `.env.example` to `.env` and fill in the required values before running locally.
 
@@ -32,7 +34,7 @@ Copy `.env.example` to `.env` and fill in the required values before running loc
 | `/health` | GET | Health check — returns `{"status":"ok"}` |
 | `/.well-known/agent-card.json` | GET | **A2A v1 capability discovery** — lists all 6 skills and auth scheme |
 
-### Authenticated (require `X-API-Key` + `A2A-Version: 1.0` headers)
+### Authenticated (require `X-API-Key` header)
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
@@ -44,17 +46,22 @@ Copy `.env.example` to `.env` and fill in the required values before running loc
 
 This server implements [A2A Protocol v1.0](https://github.com/a2aproject/A2A) using **JSON-RPC 2.0 over HTTP**.
 
+### How it works
+
+All requests are plain-text natural language queries. The server routes each query through **Gemini 2.0 Flash** (via Google ADK), which interprets the intent, calls the appropriate Google Maps API tool, and returns a conversational plain-text answer.
+
+You do not need to specify a skill type — Gemini selects the right tool based on the query text.
+
 ### Required headers
 
 ```
 X-API-Key: <your API key>
 Content-Type: application/json
-A2A-Version: 1.0
 ```
 
 ### Request format
 
-All operations use `POST /` with the `SendMessage` method:
+All operations use `POST /` with the `SendMessage` method and a plain-text message part:
 
 ```json
 {
@@ -66,16 +73,7 @@ All operations use `POST /` with the `SendMessage` method:
       "messageId": "<uuid>",
       "role": "ROLE_USER",
       "parts": [
-        {
-          "data": {
-            "type": "<task-type>",
-            "input": {
-              "format": "<input-format>",
-              "content": "<string or object>"
-            }
-          },
-          "mediaType": "application/json"
-        }
+        {"text": "<your natural language query>"}
       ]
     }
   }
@@ -84,7 +82,7 @@ All operations use `POST /` with the `SendMessage` method:
 
 ### Response format
 
-On success, the result is in `result.message.parts[0].data`:
+The agent's answer is in `result.message.parts[0].text`:
 
 ```json
 {
@@ -94,23 +92,8 @@ On success, the result is in `result.message.parts[0].data`:
     "message": {
       "role": "ROLE_AGENT",
       "parts": [
-        {
-          "data": { ...Google Maps API result... },
-          "mediaType": "application/json"
-        }
+        {"text": "<conversational answer from Gemini>"}
       ]
-    }
-  }
-}
-```
-
-On error, the result message part is a text string:
-
-```json
-{
-  "result": {
-    "message": {
-      "parts": [{ "text": "Error: Geocoding failed: ZERO_RESULTS" }]
     }
   }
 }
@@ -122,7 +105,6 @@ On error, the result message part is a text string:
 curl -X POST https://google-maps-a2a.fly.dev/ \
   -H "X-API-Key: <your-key>" \
   -H "Content-Type: application/json" \
-  -H "A2A-Version: 1.0" \
   -d '{
     "jsonrpc": "2.0",
     "id": "1",
@@ -131,149 +113,99 @@ curl -X POST https://google-maps-a2a.fly.dev/ \
       "message": {
         "messageId": "m1",
         "role": "ROLE_USER",
-        "parts": [{
-          "data": {
-            "type": "geocode",
-            "input": {"format": "text", "content": "1600 Amphitheatre Parkway, Mountain View, CA"}
-          },
-          "mediaType": "application/json"
-        }]
+        "parts": [{"text": "What are the GPS coordinates for 1600 Amphitheatre Parkway, Mountain View, CA?"}]
       }
     }
   }'
 ```
 
----
-
-## Task Types
-
-All 6 task types use the same JSON-RPC `SendMessage` envelope. Only the `data` payload changes.
-
-### geocode — Address → coordinates
-
-Input formats: `text`, `application/json`
-Output formats: `application/json` (default), `application/geo+json`
-
-```json
-{"type": "geocode", "input": {"format": "text", "content": "Times Square, New York"}}
-```
-
-```json
-{"type": "geocode", "input": {"format": "application/json", "content": {"address": "Times Square"}}}
-```
-
-Request GeoJSON output by adding an `output` field:
+Example response:
 
 ```json
 {
-  "type": "geocode",
-  "input": {"format": "text", "content": "Times Square, New York"},
-  "output": {"format": "application/geo+json"}
+  "jsonrpc": "2.0",
+  "id": "1",
+  "result": {
+    "message": {
+      "role": "ROLE_AGENT",
+      "parts": [{"text": "The GPS coordinates for 1600 Amphitheatre Parkway, Mountain View, CA are approximately 37.4224° N, 122.0855° W (latitude: 37.4224764, longitude: -122.0855862)."}]
+    }
+  }
 }
 ```
 
-Result path: `result.message.parts[0].data.results[0].geometry.location` → `{lat, lng}`
+---
+
+## Skills
+
+All 6 skills are invoked by sending a natural language query. Below are example queries and what each skill handles.
+
+### geocode — Address → coordinates
+
+Converts an address or place name to GPS coordinates (lat/lng).
+
+Example queries:
+- `"What are the coordinates for the Eiffel Tower?"`
+- `"Convert 350 Fifth Avenue New York NY to GPS coordinates"`
+- `"Find the latitude and longitude of O'Hare International Airport"`
 
 ---
 
 ### reverse_geocode — Coordinates → address
 
-Input format: `application/json` (requires `lat` and `lng`)
-Output formats: `application/json` (default), `text`
+Converts GPS coordinates to a human-readable address.
 
-```json
-{
-  "type": "reverse_geocode",
-  "input": {"format": "application/json", "content": {"lat": 37.4224864, "lng": -122.0855962}}
-}
-```
-
-Result path: `result.message.parts[0].data.results[0].formatted_address`
+Example queries:
+- `"What address is at latitude 37.42 longitude -122.08?"`
+- `"What street is located at coordinates 40.7580, -73.9855?"`
+- `"What place is at GPS coordinates 48.8584, 2.2945?"`
 
 ---
 
 ### directions — Route planning
 
-Input format: `application/json` (requires `origin` and `destination`; optional `mode`: `driving` | `walking` | `transit` | `bicycling`)
-Output formats: `application/json` (default), `text` (numbered step list)
+Gets driving, walking, transit, or bicycling directions between two locations.
 
-```json
-{
-  "type": "directions",
-  "input": {
-    "format": "application/json",
-    "content": {"origin": "San Francisco, CA", "destination": "Los Angeles, CA", "mode": "driving"}
-  }
-}
-```
-
-Result path: `result.message.parts[0].data.routes[0].legs[0]` → distance, duration, steps
+Example queries:
+- `"How do I drive from San Francisco to Los Angeles?"`
+- `"Give me step-by-step walking directions from Central Park to the Met Museum"`
+- `"What is the transit route from downtown Chicago to O'Hare?"`
+- `"How long does it take to drive from Seattle to Portland?"`
 
 ---
 
 ### places_search — Search for places
 
-Input formats: `text` (search query), `application/json` (query + optional location/radius)
-Output formats: `application/json` (default), `application/geo+json`
+Searches for businesses, points of interest, and places using Google Places.
 
-```json
-{"type": "places_search", "input": {"format": "text", "content": "coffee shops near Union Square SF"}}
-```
-
-```json
-{
-  "type": "places_search",
-  "input": {
-    "format": "application/json",
-    "content": {
-      "query": "pizza",
-      "location": {"lat": 37.7749, "lng": -122.4194},
-      "radius": 1000
-    }
-  }
-}
-```
-
-Result path: `result.message.parts[0].data.results[]` → array of places
+Example queries:
+- `"Find Italian restaurants near Times Square New York"`
+- `"What hotels are close to LAX airport?"`
+- `"Search for pharmacies within a mile of downtown Chicago"`
+- `"Are there any parks near the Eiffel Tower?"`
 
 ---
 
-### place_details — Full details for a place
+### place_details — Details for a specific place
 
-Input format: `application/json` (requires `place_id`)
-Output format: `application/json`
+Gets detailed information about a place: hours, phone number, website, rating, etc.
 
-```json
-{
-  "type": "place_details",
-  "input": {"format": "application/json", "content": {"place_id": "ChIJ2eUgeAK6j4ARbn5u_wAGqWA"}}
-}
-```
-
-Result path: `result.message.parts[0].data.result` → name, address, hours, rating, etc.
+Example queries:
+- `"What are the opening hours and phone number for the Louvre Museum?"`
+- `"Tell me about the Googleplex — address, hours, and rating"`
+- `"What is the website and rating for the Empire State Building?"`
 
 ---
 
-### distance_matrix — Distances between multiple points
+### distance_matrix — Travel distances and times
 
-Input format: `application/json` (requires `origins` and `destinations` arrays; optional `mode`)
-Output format: `application/json`
+Calculates distances and travel times between multiple origins and destinations.
 
-```json
-{
-  "type": "distance_matrix",
-  "input": {
-    "format": "application/json",
-    "content": {
-      "origins": ["San Francisco, CA", "Oakland, CA"],
-      "destinations": ["Mountain View, CA", "San Jose, CA"],
-      "mode": "driving"
-    }
-  }
-}
-```
-
-Result path: `result.message.parts[0].data.rows[i].elements[j]` → distance, duration per pair
+Example queries:
+- `"How far is New York from Boston by car?"`
+- `"Compare driving times from Denver to Boulder, Fort Collins, and Colorado Springs"`
+- `"What is the travel distance and time from Miami to Orlando?"`
+- `"Calculate driving distances from San Francisco to both Oakland and San Jose"`
 
 ---
 
@@ -293,10 +225,13 @@ Result path: `result.message.parts[0].data.rows[i].elements[j]` → distance, du
 |------|---------|
 | `-32601` | Method not found |
 | `-32602` | Invalid params |
-| `-32009` | A2A version not supported (include `A2A-Version: 1.0` header) |
 
 ### Application errors (HTTP 200, `result.message.parts[0].text`)
 
-When a task fails (e.g., invalid input, Google Maps API error), the response is still HTTP 200 with a JSON-RPC success result, but the message part contains a `text` field with the error description instead of a `data` field.
+All responses — including errors — return HTTP 200 with a JSON-RPC result. When a query fails (e.g., a place isn't found, an address is invalid, or a Google Maps API error occurs), the `text` part contains an error description from Gemini.
 
-Always check whether `parts[0]` has `data` (success) or `text` (error) before extracting the result.
+Always read `result.message.parts[0].text` to get the answer or error message.
+
+### Rate limiting (429)
+
+Gemini API rate limits are handled automatically with exponential backoff (up to 3 retries: 5s, 10s, 20s). If all retries are exhausted, a JSON-RPC error is returned.

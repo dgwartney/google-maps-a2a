@@ -47,7 +47,7 @@ Navigate to **APIs & Services → Library** in the Cloud Console, or use the dir
 
 1. Go to **APIs & Services → Credentials**: https://console.cloud.google.com/apis/credentials
 2. Click **Create Credentials → API key**
-3. Copy the key value — this is your `GOOGLE_MAPS_API_KEY`
+3. Copy the key value — this is your `MAPS_A2A_MAPS_KEY`
 
 Documentation: https://developers.google.com/maps/documentation/geocoding/get-api-key
 
