@@ -10,6 +10,7 @@ Framework:   a2a-sdk + Starlette
 import hmac
 import logging
 import os
+import re
 from typing import Any
 
 import httpx
@@ -43,27 +44,25 @@ class Config(BaseSettings):
         env_file=".env", env_file_encoding="utf-8", extra="ignore"
     )
 
-    api_key: str = ""
-    google_maps_api_key: str = ""
-    google_api_key: str = ""
+    a2a_api_key: str = ""
+    maps_a2a_maps_key: str = ""     # MAPS_A2A_MAPS_KEY — Google Maps Platform calls
+    maps_a2a_gemini_key: str = ""   # MAPS_A2A_GEMINI_KEY — Gemini LLM via ADK
     log_level: str = "INFO"
     allowed_ips: str = ""
     base_url: str = "https://google-maps-a2a.fly.dev"
 
-    @field_validator("google_maps_api_key")
+    @field_validator("maps_a2a_maps_key")
     @classmethod
-    def google_maps_key_must_be_set(cls, v: str) -> str:
+    def maps_key_must_be_set(cls, v: str) -> str:
         if not v:
-            raise ValueError("GOOGLE_MAPS_API_KEY must be set before starting the server")
+            raise ValueError("MAPS_A2A_MAPS_KEY must be set before starting the server")
         return v
 
-    @field_validator("google_api_key")
+    @field_validator("maps_a2a_gemini_key")
     @classmethod
-    def google_api_key_must_be_set(cls, v: str) -> str:
+    def gemini_key_must_be_set(cls, v: str) -> str:
         if not v:
-            raise ValueError(
-                "GOOGLE_API_KEY must be set. Get from https://aistudio.google.com/app/apikey"
-            )
+            raise ValueError("MAPS_A2A_GEMINI_KEY must be set before starting the server")
         return v
 
     @field_validator("log_level")
@@ -82,8 +81,9 @@ class Config(BaseSettings):
 
 config = Config()
 
-# Set GOOGLE_API_KEY before importing ADK modules (ADK reads this at import time)
-os.environ["GOOGLE_API_KEY"] = config.google_api_key
+# ADK/google-genai reads GOOGLE_API_KEY. Pass MAPS_A2A_GEMINI_KEY directly
+# so the project-specific key is never confused with any shell-level GOOGLE_API_KEY.
+os.environ["GOOGLE_API_KEY"] = config.maps_a2a_gemini_key
 
 logging.basicConfig(
     level=getattr(logging, config.log_level, logging.INFO),
@@ -91,8 +91,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-if not config.api_key:  # pragma: no cover
-    logger.warning("API_KEY is not set — all authenticated endpoints will reject requests")
+if not config.a2a_api_key:  # pragma: no cover
+    logger.warning("A2A_API_KEY is not set — all authenticated endpoints will reject requests")
 
 # ---------------------------------------------------------------------------
 # Google Maps Service (handlers unchanged from original)
@@ -254,9 +254,8 @@ class GoogleMapsService:
         return data
 
 
-maps_service = GoogleMapsService(config.google_maps_api_key)
+maps_service = GoogleMapsService(config.maps_a2a_maps_key)
 
-# Import ADK agent and executor after GOOGLE_API_KEY env var is set
 from agent import GoogleMapsAgent  # noqa: E402
 from agent_executor import GoogleMapsAgentExecutor  # noqa: E402
 
@@ -270,7 +269,7 @@ SKILL_DEFINITIONS = [
     AgentSkill(
         id="geocode",
         name="Geocode",
-        description="Convert an address to latitude/longitude coordinates. Returns JSON or GeoJSON.",
+        description="Convert an address or place name to GPS coordinates.",
         tags=["maps", "geocoding", "coordinates"],
         examples=[
             "What are the coordinates for the Eiffel Tower?",
@@ -278,8 +277,8 @@ SKILL_DEFINITIONS = [
             "Where is O'Hare International Airport on a map?",
             "Find the latitude and longitude of the Sydney Opera House",
         ],
-        input_modes=["application/json", "text/plain"],
-        output_modes=["application/json", "application/geo+json"],
+        input_modes=["text/plain"],
+        output_modes=["text/plain"],
     ),
     AgentSkill(
         id="reverse_geocode",
@@ -291,8 +290,8 @@ SKILL_DEFINITIONS = [
             "What street is located at coordinates 40.7580, -73.9855?",
             "What place is at GPS coordinates 48.8584, 2.2945?",
         ],
-        input_modes=["application/json"],
-        output_modes=["application/json", "text/plain"],
+        input_modes=["text/plain"],
+        output_modes=["text/plain"],
     ),
     AgentSkill(
         id="directions",
@@ -305,8 +304,8 @@ SKILL_DEFINITIONS = [
             "What is the walking route from Central Park to the Metropolitan Museum?",
             "How long does it take to drive from Seattle to Portland?",
         ],
-        input_modes=["application/json"],
-        output_modes=["application/json", "text/plain"],
+        input_modes=["text/plain"],
+        output_modes=["text/plain"],
     ),
     AgentSkill(
         id="places_search",
@@ -319,21 +318,21 @@ SKILL_DEFINITIONS = [
             "Search for pharmacies within a mile of downtown Chicago",
             "Are there any parks near the Eiffel Tower?",
         ],
-        input_modes=["application/json", "text/plain"],
-        output_modes=["application/json", "application/geo+json"],
+        input_modes=["text/plain"],
+        output_modes=["text/plain"],
     ),
     AgentSkill(
         id="place_details",
         name="Place Details",
-        description="Get detailed information about a specific place by its Google place_id.",
+        description="Get detailed information about a specific place.",
         tags=["maps", "places", "details"],
         examples=[
             "What are the opening hours and phone number for the Louvre Museum?",
-            "Get full details about the Googleplex",
+            "Tell me about the Googleplex",
             "What is the rating and website for the Empire State Building?",
         ],
-        input_modes=["application/json"],
-        output_modes=["application/json"],
+        input_modes=["text/plain"],
+        output_modes=["text/plain"],
     ),
     AgentSkill(
         id="distance_matrix",
@@ -346,8 +345,8 @@ SKILL_DEFINITIONS = [
             "What is the travel distance and time from Miami to Orlando?",
             "Calculate distances from our warehouse to all three delivery locations",
         ],
-        input_modes=["application/json"],
-        output_modes=["application/json"],
+        input_modes=["text/plain"],
+        output_modes=["text/plain"],
     ),
 ]
 
@@ -360,8 +359,8 @@ AGENT_CARD = AgentCard(
     version="2.0.0",
     documentation_url="https://github.com/dgwartney/google-maps-a2a",
     capabilities=AgentCapabilities(streaming=False, push_notifications=False),
-    default_input_modes=["application/json"],
-    default_output_modes=["application/json"],
+    default_input_modes=["text/plain"],
+    default_output_modes=["text/plain"],
     supported_interfaces=[
         AgentInterface(
             url=f"{config.base_url.rstrip('/')}/",
@@ -412,7 +411,7 @@ class SecurityMiddleware(BaseHTTPMiddleware):
         if not api_key:
             logger.warning("Authentication failed: missing X-API-Key header")
             return JSONResponse({"detail": "Missing API key"}, status_code=403)
-        if not hmac.compare_digest(api_key, config.api_key):
+        if not hmac.compare_digest(api_key, config.a2a_api_key):
             logger.warning("Authentication failed: invalid API key")
             return JSONResponse({"detail": "Invalid API key"}, status_code=401)
 

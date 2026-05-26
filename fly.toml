@@ -1,7 +1,4 @@
-# fly.toml app configuration file generated for google-maps-a2a on 2026-05-22T13:51:56-07:00
-#
-# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
-#
+# fly.toml app configuration file for google-maps-a2a
 
 app = 'google-maps-a2a'
 primary_region = 'iad'
@@ -27,12 +24,12 @@ primary_region = 'iad'
   [[http_service.checks]]
     interval = '30s'
     timeout = '5s'
-    grace_period = '10s'
+    grace_period = '180s'
     method = 'GET'
     path = '/health'
 
 [[vm]]
-  memory = '256mb'
+  memory = '512mb'
   cpu_kind = 'shared'
   cpus = 1
-  memory_mb = 256
+  memory_mb = 512

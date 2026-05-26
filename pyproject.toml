@@ -24,3 +24,8 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "--cov=main --cov=agent --cov=agent_executor"
+markers = [
+    "local: fast unit tests — all external calls mocked, no real API keys needed",
+    "integration: real Gemini LLM + mocked Maps HTTP — requires a valid GEMINI_API_KEY",
+    "deployment: smoke tests against the live deployed server — requires A2A_API_KEY and A2A_URL",
+]

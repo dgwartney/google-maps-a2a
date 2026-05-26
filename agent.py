@@ -96,7 +96,7 @@ class GoogleMapsAgent:
             )
 
         async def distance_matrix(
-            origins: list, destinations: list, mode: str = "driving"
+            origins: list[str], destinations: list[str], mode: str = "driving"
         ) -> dict:
             """Calculate travel distances and times between multiple origins and destinations.
 

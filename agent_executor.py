@@ -1,11 +1,10 @@
-"""AgentExecutor bridging Google ADK to a2a-sdk 1.0.3 (A2A Protocol v1.0)."""
+"""AgentExecutor bridging Google ADK to a2a-sdk (A2A Protocol v1.0)."""
 import logging
 import uuid
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
-from a2a.server.tasks.task_updater import TaskUpdater
-from a2a.types.a2a_pb2 import Part, Task, TaskState, TaskStatus
+from a2a.types.a2a_pb2 import Message, Part, Role
 from google.adk import Runner
 from google.adk.artifacts import InMemoryArtifactService
 from google.adk.memory.in_memory_memory_service import InMemoryMemoryService
@@ -20,15 +19,8 @@ logger = logging.getLogger(__name__)
 class GoogleMapsAgentExecutor(AgentExecutor):
     """Executes Google Maps queries via ADK Gemini agent.
 
-    Bridges a2a-sdk 1.0.3 (A2A Protocol v1.0) to Google ADK tool-calling.
-    All requests are processed by Gemini 2.0 Flash which selects and calls
-    the appropriate Google Maps skill, then returns a natural language response.
-
-    Uses the Task + artifacts pattern:
-    1. Enqueue Task (TASK_STATE_WORKING) — required before TaskStatusUpdateEvents
-    2. Stream ADK response via Runner.run_async()
-    3. Add text artifact with the natural language response
-    4. Mark task COMPLETED
+    Accepts plain-text input, routes through Gemini 2.0 Flash with Maps tools,
+    and returns a plain-text Message so callers receive result.message.parts[0].text.
     """
 
     APP_NAME: str = "google_maps_agent"
@@ -45,11 +37,6 @@ class GoogleMapsAgentExecutor(AgentExecutor):
         logger.info("GoogleMapsAgentExecutor initialised")
 
     async def _get_or_create_session(self, session_id: str):
-        """Return existing session or create a new one.
-
-        Reuses sessions within the same context_id to enable multi-turn
-        conversation continuity.
-        """
         session = await self._runner.session_service.get_session(
             app_name=self.APP_NAME,
             user_id=self.USER_ID,
@@ -65,55 +52,42 @@ class GoogleMapsAgentExecutor(AgentExecutor):
         return session
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
-        """Execute a natural language query through the ADK Gemini agent."""
+        """Run the user query through the ADK Gemini agent and emit a text Message."""
         query = context.get_user_input()
         task_id = context.task_id or str(uuid.uuid4())
         context_id = context.context_id or str(uuid.uuid4())
 
-        # Enqueue Task first — required by a2a-sdk before any TaskStatusUpdateEvent
-        task = Task(
-            id=task_id,
-            context_id=context_id,
-            status=TaskStatus(state=TaskState.TASK_STATE_WORKING),
+        logger.info("ADK executing task_id=%s query=%r", task_id, query[:120])
+
+        session = await self._get_or_create_session(context_id)
+        content = genai_types.Content(
+            role="user",
+            parts=[genai_types.Part.from_text(text=query)],
         )
-        await event_queue.enqueue_event(task)
 
-        updater = TaskUpdater(event_queue, task_id, context_id)
+        response_text = ""
+        async for event in self._runner.run_async(
+            user_id=self.USER_ID,
+            session_id=session.id,
+            new_message=content,
+        ):
+            if event.is_final_response() and event.content:
+                response_text = "\n".join(
+                    p.text
+                    for p in event.content.parts
+                    if hasattr(p, "text") and p.text
+                )
 
-        try:
-            logger.info("ADK executing task_id=%s query=%r", task_id, query[:80])
-
-            session = await self._get_or_create_session(context_id)
-            content = genai_types.Content(
-                role="user",
-                parts=[genai_types.Part.from_text(text=query)],
-            )
-
-            response_text = ""
-            async for event in self._runner.run_async(
-                user_id=self.USER_ID,
-                session_id=session.id,
-                new_message=content,
-            ):
-                if event.is_final_response() and event.content:
-                    response_text = "\n".join(
-                        p.text
-                        for p in event.content.parts
-                        if hasattr(p, "text") and p.text
-                    )
-
-            await updater.add_artifact(
-                [Part(text=response_text or "No response generated.")],
-                name="response",
-            )
-            await updater.complete()
-            logger.info("ADK task completed task_id=%s", task_id)
-
-        except Exception:
-            logger.error("ADK task failed task_id=%s", task_id, exc_info=True)
-            await updater.failed()
+        response_msg = Message(
+            role=Role.ROLE_AGENT,
+            task_id=task_id,
+            context_id=context_id,
+            message_id=str(uuid.uuid4()),
+            parts=[Part(text=response_text or "No response generated.")],
+        )
+        await event_queue.enqueue_event(response_msg)
+        logger.info("ADK task completed task_id=%s", task_id)
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
-        """Cancel is not supported — ADK sessions complete synchronously."""
         logger.info("Cancel requested task_id=%s (not supported)", context.task_id)
         raise NotImplementedError("Cancellation is not supported for ADK agents")
