@@ -51,7 +51,7 @@ client = httpx.Client(base_url=BASE_URL, timeout=30.0)
 def pace_requests():
     """Sleep after each test to stay within Gemini free-tier rate limits (15 RPM)."""
     yield
-    time.sleep(8)
+    time.sleep(15)
 
 
 # ---------------------------------------------------------------------------
