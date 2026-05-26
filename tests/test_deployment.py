@@ -40,7 +40,7 @@ AUTH_HEADERS = {
     "A2A-Version": "1.0",
 }
 
-client = httpx.Client(base_url=BASE_URL, timeout=30.0)
+client = httpx.Client(base_url=BASE_URL, timeout=60.0)
 
 
 # ---------------------------------------------------------------------------
