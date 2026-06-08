@@ -61,6 +61,7 @@ curl https://google-maps-a2a.fly.dev/.well-known/agent-card.json
 curl -X POST https://google-maps-a2a.fly.dev/ \
   -H "X-API-Key: <A2A_API_KEY>" \
   -H "Content-Type: application/json" \
+  -H "A2A-Version: 1.0" \
   -d '{
     "jsonrpc":"2.0","id":"1","method":"SendMessage",
     "params":{"message":{"messageId":"m1","role":"ROLE_USER","parts":[

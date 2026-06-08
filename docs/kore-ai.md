@@ -194,6 +194,7 @@ Before configuring Kore, verify the server responds correctly:
 curl -X POST https://google-maps-a2a.fly.dev/ \
   -H "X-API-Key: <your-A2A_API_KEY>" \
   -H "Content-Type: application/json" \
+  -H "A2A-Version: 1.0" \
   -d '{
     "jsonrpc": "2.0",
     "id": "test-1",

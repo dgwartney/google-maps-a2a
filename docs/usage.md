@@ -105,6 +105,7 @@ The agent's answer is in `result.message.parts[0].text`:
 curl -X POST https://google-maps-a2a.fly.dev/ \
   -H "X-API-Key: <your-key>" \
   -H "Content-Type: application/json" \
+  -H "A2A-Version: 1.0" \
   -d '{
     "jsonrpc": "2.0",
     "id": "1",
