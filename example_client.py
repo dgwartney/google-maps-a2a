@@ -22,6 +22,7 @@ API_KEY = os.getenv("A2A_API_KEY", "your_api_key_here")
 HEADERS = {
     "X-API-Key": API_KEY,
     "Content-Type": "application/json",
+    "A2A-Version": "1.0",
 }
 
 
