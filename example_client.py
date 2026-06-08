@@ -16,7 +16,7 @@ import uuid
 
 import httpx
 
-BASE_URL = os.getenv("A2A_BASE_URL", "http://localhost:8000")
+BASE_URL = os.getenv("A2A_URL", "http://localhost:8000")
 API_KEY = os.getenv("A2A_API_KEY", "your_api_key_here")
 
 HEADERS = {

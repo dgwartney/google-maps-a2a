@@ -30,7 +30,7 @@ class GoogleMapsAgent:
     def __init__(self, maps_service: Any) -> None:
         self._maps_service = maps_service
         self.agent: LlmAgent = self._build_agent()
-        logger.info("GoogleMapsAgent initialised with model=gemini-2.0-flash")
+        logger.info("GoogleMapsAgent initialised with model=gemini-2.5-flash")
 
     def _build_agent(self) -> LlmAgent:
         """Creates the LlmAgent with 6 Google Maps tools bound to maps_service."""
@@ -112,7 +112,7 @@ class GoogleMapsAgent:
             )
 
         return LlmAgent(
-            model="gemini-2.0-flash",
+            model="gemini-2.5-flash",
             name="google_maps_agent",
             description="Google Maps assistant — locations, directions, places, distances",
             instruction=self.SYSTEM_PROMPT,

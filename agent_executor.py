@@ -80,7 +80,7 @@ class GoogleMapsAgentExecutor(AgentExecutor):
                 return response_text
             except (ResourceExhausted, ClientError) as exc:
                 is_rate_limit = isinstance(exc, ResourceExhausted) or (
-                    isinstance(exc, ClientError) and exc.status_code == 429
+                    isinstance(exc, ClientError) and exc.code == 429
                 )
                 if is_rate_limit:
                     last_exc = exc
